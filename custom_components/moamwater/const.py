@@ -7,6 +7,16 @@ OKTA_BASE_URL = "https://auth.amwater.com"
 OKTA_ISSUER_PATH = "/oauth2/aus29oxmv4bzpt55X5d7"  # captured from bearer token 'iss' claim
 OKTA_CLIENT_ID = "0oa29ovb79AWEoS8V5d7"  # captured from bearer token 'cid' claim
 
+# This Okta app registration's allowed grant types are `authorization_code`,
+# `password`, and `refresh_token` (confirmed via the `unauthorized_client`
+# error returned by /v1/interact -- the Interaction Code/OIE grant is NOT
+# enabled for this client). So login uses the classic Okta AuthN API
+# (`/api/v1/authn`) to establish a session, then the standard
+# `/v1/authorize` + `/v1/token` (grant_type=authorization_code) PKCE dance
+# to mint an access token, instead of the newer IDX/interaction-code flow.
+OKTA_AUTHN_URL = f"{OKTA_BASE_URL}/api/v1/authn"
+OKTA_AUTHN_FACTORS_VERIFY_URL = f"{OKTA_BASE_URL}/api/v1/authn/factors/{{factor_id}}/verify"
+
 MYWATER_BASE_URL = "https://mywaterv2.amwater.com"
 MYWATER_LOGIN_REDIRECT_PATH = "/openidlogin"
 MYWATER_DATA_ENDPOINT = "/api/mso/data"
