@@ -1,28 +1,50 @@
 """Okta authentication client for Missouri American Water's MyWater portal.
 
-Login flow used by this client (classic Okta AuthN API + authorization_code):
+Login flow used by this client (classic Okta AuthN API + authorization_code,
+WITHOUT PKCE -- confirmed against a real captured browser trace):
 
+    GET  {OKTA_BASE_URL}{issuer}/v1/authorize?client_id=...&response_type=code&
+         scope=...&redirect_uri=...&state=...                      -> the real
+      MyWater SPA hits this FIRST, before any credentials are submitted. It
+      returns status 200 with the Okta Sign-In Widget's HTML host page (not a
+      redirect), and -- critically -- establishes an Okta transaction/session
+      tied to this exact `state` value via response cookies. We must issue
+      this GET (and keep its cookies in our aiohttp session) before doing
+      anything else, or the later sessionToken redemption has no transaction
+      to attach to and Okta just re-serves the same HTML widget page again.
     POST {OKTA_BASE_URL}/api/v1/authn                          -> primary auth
-      (username/password). Returns status "SUCCESS" with a `sessionToken`,
-      or status "MFA_REQUIRED" with a list of enrolled `factors` plus a
-      `stateToken` used to drive the MFA step.
+      (username/password), reusing the cookie jar from the GET above. Returns
+      status "SUCCESS" with a `sessionToken`, or status "MFA_REQUIRED" with a
+      list of enrolled `factors` plus a `stateToken` used to drive the MFA
+      step.
     POST {OKTA_BASE_URL}/api/v1/authn/factors/{id}/verify        -> submit the
       passcode for the chosen factor; on success also returns a
       `sessionToken`.
-    GET  {OKTA_BASE_URL}{issuer}/v1/authorize?...&sessionToken=...&
-         code_challenge=...&response_type=code                    -> redirects
+    GET  the SAME {issuer}/v1/authorize URL from step 1 (identical params,
+         same `state`) with `&sessionToken=...` appended -> NOW redirects
       (302) straight to our `redirect_uri` with a `code` query param, because
-      passing `sessionToken` short-circuits the interactive login UI.
-    POST {OKTA_BASE_URL}{issuer}/v1/token (grant_type=authorization_code)
-      -> exchanges that `code` (+ our PKCE `code_verifier`) for the real
-      `access_token` used as the Bearer credential for `/api/mso/data`.
+      the sessionToken is being redeemed against the matching transaction
+      that was opened by the very first GET.
+    POST {OKTA_BASE_URL}{issuer}/v1/token (grant_type=authorization_code, NO
+         code_verifier/PKCE -- the real browser's /v1/authorize request had
+         no code_challenge at all)
+      -> exchanges that `code` for the real `access_token` used as the
+      credential for `/api/mso/data`.
 
-IMPORTANT: an earlier version of this file attempted Okta's newer Identity
-Engine "Interaction Code" flow (`POST /v1/interact`), but this Okta app
-registration only has `authorization_code`, `password`, and `refresh_token`
-grants enabled -- `/v1/interact` reliably fails with
-`unauthorized_client: The client is not authorized to use the provided grant
-type`. Hence the classic AuthN-API-driven authorization_code flow above.
+IMPORTANT history of failed approaches (do not repeat these mistakes):
+  - An earlier version attempted Okta's newer Identity Engine "Interaction
+    Code" flow (`POST /v1/interact`), but this Okta app registration only has
+    `authorization_code`, `password`, and `refresh_token` grants enabled --
+    `/v1/interact` reliably fails with `unauthorized_client: The client is
+    not authorized to use the provided grant type`.
+  - A later version added PKCE and generated a brand-new `/v1/authorize` URL
+    (new `state`, new code_challenge) only AFTER obtaining the sessionToken,
+    without ever having done the initial unauthenticated GET. This always
+    returned status 200 with the interactive HTML widget instead of a 302,
+    because there was no prior transaction for the sessionToken to redeem
+    against. A real captured `/v1/authorize` response's embedded `oktaData`
+    JS object also confirmed the genuine browser request carries no
+    `code_challenge` param at all -- PKCE is not part of this org's flow.
 
 Also important: the captured `Authorization: bearer ...` header used by
 MyWater's `/api/mso/data` calls decodes as an Okta **access token** (JWT
@@ -33,8 +55,6 @@ exchange rather than scraping cookies.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import logging
 import secrets
 from typing import Any
@@ -87,20 +107,12 @@ class MfaRequired(Exception):
         self.factors = factors
 
 
-def _gen_pkce_pair() -> tuple[str, str]:
-    """Generate a PKCE code_verifier/code_challenge pair (S256)."""
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    digest = hashlib.sha256(verifier.encode()).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    return verifier, challenge
-
-
 class MoAmWaterAuthClient:
     """Handles the multi-step Okta AuthN login and authorization_code exchange."""
 
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
-        self._code_verifier: str | None = None
+        self._authorize_url: str | None = None
         self._state_token: str | None = None
         self._factors: list[dict[str, Any]] = []
 
@@ -111,8 +123,21 @@ class MoAmWaterAuthClient:
         raises MfaRequired if a factor challenge must be completed via
         async_submit_mfa().
         """
-        self._code_verifier, _ = _gen_pkce_pair()
         _LOGGER.debug("Starting MyWater login for user %s", username)
+
+        # Step 1: open the same unauthenticated /v1/authorize transaction the
+        # real browser opens before ever prompting for credentials. This is
+        # what a later sessionToken redemption needs to attach to -- without
+        # it, Okta just re-serves the interactive HTML widget (status 200)
+        # instead of redirecting with a code. We remember the exact URL
+        # (with its `state`) so we hit the identical URL again in step 3.
+        self._authorize_url = self._build_authorize_url()
+        async with self._session.get(self._authorize_url, allow_redirects=True) as resp:
+            await resp.read()
+            _LOGGER.debug(
+                "Initial /v1/authorize GET returned status %s (expected 200 widget page)",
+                resp.status,
+            )
 
         async with self._session.post(
             OKTA_AUTHN_URL,
@@ -178,45 +203,35 @@ class MoAmWaterAuthClient:
 
         return await self._async_finish_with_session_token(session_token)
 
-    async def _async_finish_with_session_token(self, session_token: str) -> dict[str, Any]:
-        """Redeem an Okta `sessionToken` for an authorization `code`, then tokens.
-
-        Passing `sessionToken` to `/v1/authorize` short-circuits Okta's
-        interactive sign-in widget and redirects (302) straight to our
-        `redirect_uri` with a `code` query parameter, since we're already
-        authenticated for this session token.
-        """
-        if not self._code_verifier:
-            raise MoAmWaterAuthError("No code_verifier available; login was not started correctly")
-
-        digest = hashlib.sha256(self._code_verifier.encode()).digest()
-        code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-
+    def _build_authorize_url(self) -> str:
+        """Build the unauthenticated /v1/authorize URL (no PKCE, matches real browser)."""
         authorize_params = {
             "client_id": OKTA_CLIENT_ID,
             "response_type": "code",
             "scope": OKTA_SCOPES,
             "redirect_uri": OKTA_REDIRECT_URI,
             "state": secrets.token_urlsafe(16),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "sessionToken": session_token,
         }
-        authorize_url = f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
+        return f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
 
-        # Passing `sessionToken` directly as a query param on /v1/authorize is
-        # a classic-Okta-only shortcut that Identity Engine (OIE) orgs like
-        # this one do not honor (it just serves the interactive sign-in page,
-        # status 200, instead of redirecting). The correct OIE-compatible way
-        # to redeem a sessionToken is `/login/sessionCookieRedirect`, which
-        # sets an Okta session cookie for us and then 302s into whatever
-        # `redirectUrl` we supply -- so we point it at our /v1/authorize URL.
-        session_redirect_params = {"token": session_token, "redirectUrl": authorize_url}
-        session_redirect_url = (
-            f"{OKTA_BASE_URL}/login/sessionCookieRedirect?{urlencode(session_redirect_params)}"
-        )
+    async def _async_finish_with_session_token(self, session_token: str) -> dict[str, Any]:
+        """Redeem an Okta `sessionToken` for an authorization `code`, then tokens.
 
-        code_value = await self._walk_redirects_for_code(session_redirect_url)
+        Re-hits the EXACT same /v1/authorize URL (same `state`) opened at the
+        start of async_start_login, now with `sessionToken` appended. Because
+        that URL already opened a transaction (and our aiohttp session kept
+        the resulting cookies), Okta now redirects (302) straight to our
+        `redirect_uri` with a `code` query parameter instead of re-serving
+        the interactive widget HTML.
+        """
+        if not self._authorize_url:
+            raise MoAmWaterAuthError(
+                "No prior /v1/authorize transaction; login was not started correctly"
+            )
+
+        redeem_url = f"{self._authorize_url}&{urlencode({'sessionToken': session_token})}"
+
+        code_value = await self._walk_redirects_for_code(redeem_url)
         if not code_value:
             raise MoAmWaterAuthError(
                 "Authorization redirect did not yield a 'code' query parameter"
@@ -269,15 +284,15 @@ class MoAmWaterAuthClient:
         return None
 
     async def _exchange_code_for_tokens(self, code: str) -> dict[str, Any]:
-        """POST {issuer}/v1/token to exchange our authorization code for tokens."""
-        if not self._code_verifier:
-            raise MoAmWaterAuthError("No code_verifier available for token exchange")
+        """POST {issuer}/v1/token to exchange our authorization code for tokens.
 
+        No PKCE `code_verifier` is sent -- the real browser's /v1/authorize
+        request never included a `code_challenge`, so none is expected here.
+        """
         payload = {
             "grant_type": "authorization_code",
             "code": code,
             "client_id": OKTA_CLIENT_ID,
-            "code_verifier": self._code_verifier,
             "redirect_uri": OKTA_REDIRECT_URI,
         }
         async with self._session.post(
