@@ -1,0 +1,11 @@
+{
+  "domain": "moamwater",
+  "name": "Missouri American Water (MyWater)",
+  "codeowners": ["@tylermsellers"],
+  "config_flow": true,
+  "documentation": "https://github.com/tylermsellers/moamwater-hacs",
+  "issue_tracker": "https://github.com/tylermsellers/moamwater-hacs/issues",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Missouri American Water (MyWater)",
+        "description": "Enter your MyWater account username and password. If your account has multi-factor authentication enabled, you'll be prompted for a one-time code on the next screen.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "mfa": {
+        "title": "Enter your verification code",
+        "description": "MyWater sent a one-time passcode (via SMS, email, or your authenticator app) to complete sign-in. Enter it below.",
+        "data": {
+          "passcode": "Verification code"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password",
+      "invalid_mfa": "Incorrect or expired verification code",
+      "cannot_connect": "Could not reach the MyWater portal — check your network connectivity",
+      "unknown": "An unexpected error occurred — check the Home Assistant logs"
+    },
+    "abort": {
+      "already_configured": "This MyWater account is already configured"
+    }
+  }
+}
