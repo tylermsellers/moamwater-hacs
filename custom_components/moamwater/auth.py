@@ -36,7 +36,10 @@ IDX_INTROSPECT = f"{OKTA_BASE_URL}/idp/idx/introspect"
 IDX_IDENTIFY = f"{OKTA_BASE_URL}/idp/idx/identify"
 IDX_CHALLENGE = f"{OKTA_BASE_URL}/idp/idx/challenge"
 IDX_CHALLENGE_ANSWER = f"{OKTA_BASE_URL}/idp/idx/challenge/answer"
-AUTHORIZE_URL = f"{OKTA_BASE_URL}{OKTA_ISSUER_PATH}/v1/authorize"
+# Okta's "Interaction Code" flow (OIE) starts with a POST to /v1/interact,
+# NOT a GET to /v1/authorize -- the latter is for the classic redirect-based
+# authorization code flow and does not return an `interaction_handle`.
+INTERACT_URL = f"{OKTA_BASE_URL}{OKTA_ISSUER_PATH}/v1/interact"
 
 
 class MoAmWaterAuthError(Exception):
@@ -50,6 +53,15 @@ class MfaRequired(Exception):
         super().__init__("MFA challenge required")
         self.state_handle = state_handle
         self.factors = factors
+
+
+def _error_summary(data: dict[str, Any]) -> str:
+    """Extract a human-readable error message from an Okta IDX error response."""
+    if isinstance(data, dict):
+        messages = data.get("messages", {}).get("value", [])
+        if messages:
+            return "; ".join(m.get("message", "") for m in messages if m.get("message"))
+    return str(data)[:500]
 
 
 def _gen_pkce_pair() -> tuple[str, str]:
@@ -76,40 +88,53 @@ class MoAmWaterAuthClient:
         """
         code_verifier, code_challenge = _gen_pkce_pair()
         self._code_verifier = code_verifier
+        _LOGGER.debug("Starting MyWater login for user %s", username)
 
-        # Step 1: kick off the authorize request to obtain an interaction/state handle.
-        # Okta's IDX flow is normally fronted by a GET to /v1/authorize with PKCE params;
-        # the SPA then introspects the resulting `stateToken`/`interactionHandle`.
-        params = {
+        # Step 1: POST /v1/interact to obtain an `interaction_handle` (this is
+        # the Okta Interaction Code / OIE flow entry point -- a GET to
+        # /v1/authorize does NOT return an interaction_handle and was the bug
+        # that caused every login attempt to fail as "invalid auth" even with
+        # correct credentials).
+        interact_payload = {
             "client_id": OKTA_CLIENT_ID,
-            "response_type": "code",
-            "response_mode": "fragment" if False else "query",
             "scope": OKTA_SCOPES,
             "redirect_uri": OKTA_REDIRECT_URI,
-            "state": secrets.token_urlsafe(16),
-            "nonce": secrets.token_urlsafe(16),
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
+            "state": secrets.token_urlsafe(16),
         }
-        async with self._session.get(AUTHORIZE_URL, params=params, allow_redirects=False) as resp:
-            # Okta responds with a redirect into the interaction handle / signin widget;
-            # extract the state handle it embeds for use in idx calls.
-            location = resp.headers.get("Location", "")
-            interaction_code = None
-            if location:
-                q = parse_qs(urlparse(location).query)
-                interaction_code = q.get("interaction_code", [None])[0]
+        async with self._session.post(
+            INTERACT_URL,
+            data=interact_payload,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise MoAmWaterAuthError(
+                    f"Okta /v1/interact failed (status {resp.status}): {body[:500]}"
+                )
+            data = await resp.json(content_type=None)
+            interaction_handle = data.get("interaction_handle")
+            if not interaction_handle:
+                raise MoAmWaterAuthError(f"No interaction_handle from /v1/interact: {data}")
+            _LOGGER.debug("Got Okta interaction_handle")
 
         # Step 2: introspect to get a stateHandle for the idx/* endpoints.
         async with self._session.post(
             IDX_INTROSPECT,
-            json={"interactionHandle": interaction_code} if interaction_code else {},
+            json={"interactionHandle": interaction_handle},
             headers={"Content-Type": "application/ion+json; okta-version=1.0.0"},
         ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise MoAmWaterAuthError(
+                    f"Okta introspect failed (status {resp.status}): {body[:500]}"
+                )
             data = await resp.json(content_type=None)
             self._state_handle = data.get("stateHandle")
             if not self._state_handle:
                 raise MoAmWaterAuthError(f"No stateHandle from introspect: {data}")
+            _LOGGER.debug("Got Okta stateHandle from introspect")
 
         # Step 3: identify (submit username).
         async with self._session.post(
@@ -119,6 +144,10 @@ class MoAmWaterAuthClient:
         ) as resp:
             data = await resp.json(content_type=None)
             self._state_handle = data.get("stateHandle", self._state_handle)
+            if resp.status >= 400:
+                raise MoAmWaterAuthError(
+                    f"identify step failed (status {resp.status}): {_error_summary(data)}"
+                )
 
         # Step 4: answer with password.
         async with self._session.post(
@@ -128,6 +157,10 @@ class MoAmWaterAuthClient:
         ) as resp:
             data = await resp.json(content_type=None)
             self._state_handle = data.get("stateHandle", self._state_handle)
+            if resp.status >= 400:
+                raise MoAmWaterAuthError(
+                    f"password step failed (status {resp.status}): {_error_summary(data)}"
+                )
 
         # Determine whether MFA is required by inspecting `remediation.value` for a
         # `select-authenticator-authenticate` or `challenge-authenticator` step.
@@ -153,6 +186,10 @@ class MoAmWaterAuthClient:
             headers={"Content-Type": "application/json"},
         ) as resp:
             data = await resp.json(content_type=None)
+            if resp.status >= 400:
+                raise MoAmWaterAuthError(
+                    f"MFA step failed (status {resp.status}): {_error_summary(data)}"
+                )
 
         return await self._finish_login_redirect(data)
 

@@ -72,9 +72,11 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self._api.async_login()
             except MfaRequired:
                 return await self.async_step_mfa()
-            except MoAmWaterAuthError:
+            except MoAmWaterAuthError as exc:
+                _LOGGER.error("MoAmWater login failed: %s", exc)
                 errors["base"] = "invalid_auth"
-            except MoAmWaterApiError:
+            except MoAmWaterApiError as exc:
+                _LOGGER.error("MoAmWater connection error: %s", exc)
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected error during MoAmWater login")
