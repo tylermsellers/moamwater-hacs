@@ -6,8 +6,7 @@
 Home Assistant integration for **Missouri American Water**'s MyWater customer
 portal (`mywaterv2.amwater.com`), pulling hourly and daily water usage
 (gallons) into Home Assistant — including long-term statistics compatible
-with the **Energy dashboard**'s water source, the same way the community
-Spire gas integration works.
+with the **Energy dashboard**'s water source.
 
 > **Unofficial project.** This is a reverse-engineered integration built by
 > inspecting MyWater's own web app network traffic. It is **not affiliated
