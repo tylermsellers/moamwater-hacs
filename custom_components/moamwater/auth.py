@@ -20,14 +20,22 @@ WITHOUT PKCE -- confirmed against a real captured browser trace):
     POST {OKTA_BASE_URL}/api/v1/authn/factors/{id}/verify        -> submit the
       passcode for the chosen factor; on success also returns a
       `sessionToken`.
-    GET  the SAME {issuer}/v1/authorize URL from step 1 (identical params,
-         same `state`) with `&sessionToken=...` appended -> NOW redirects
-      (302) straight to our `redirect_uri` with a `code` query param, because
-      the sessionToken is being redeemed against the matching transaction
-      that was opened by the very first GET.
+    GET  {OKTA_BASE_URL}/login/token/redirect?stateToken=<sessionToken>  -> a
+         Firefox HAR capture of a REAL live login proved this is the actual
+      redemption endpoint (NOT `/v1/authorize?sessionToken=...`, which this
+      org's Identity Engine tenant does not support -- it just re-serves the
+      HTML widget with status 200, confirmed twice in prior live tests). This
+      endpoint immediately 302-redirects straight to our real `redirect_uri`
+      with `code` and `state` query params, e.g.
+      `Location: https://mywaterv2.amwater.com/openidlogin?code=...&state=...`.
+      Despite the query param being named `stateToken`, the value passed here
+      is the same `sessionToken` string returned by `/api/v1/authn` (classic
+      AuthN API terminology reuses "state"/"session" loosely) -- confirmed
+      against the HAR, whose request cookies included the same `JSESSIONID`
+      established earlier in the browser session (no separate /v1/authorize
+      GET was present in that capture at all).
     POST {OKTA_BASE_URL}{issuer}/v1/token (grant_type=authorization_code, NO
-         code_verifier/PKCE -- the real browser's /v1/authorize request had
-         no code_challenge at all)
+         code_verifier/PKCE -- the real browser's flow never used PKCE)
       -> exchanges that `code` for the real `access_token` used as the
       credential for `/api/mso/data`.
 
@@ -39,12 +47,19 @@ IMPORTANT history of failed approaches (do not repeat these mistakes):
     not authorized to use the provided grant type`.
   - A later version added PKCE and generated a brand-new `/v1/authorize` URL
     (new `state`, new code_challenge) only AFTER obtaining the sessionToken,
-    without ever having done the initial unauthenticated GET. This always
-    returned status 200 with the interactive HTML widget instead of a 302,
-    because there was no prior transaction for the sessionToken to redeem
-    against. A real captured `/v1/authorize` response's embedded `oktaData`
-    JS object also confirmed the genuine browser request carries no
-    `code_challenge` param at all -- PKCE is not part of this org's flow.
+    without ever having done an initial unauthenticated GET first. This
+    always returned status 200 with the interactive HTML widget instead of a
+    302, because there was no prior transaction for the sessionToken to
+    redeem against.
+  - A subsequent version tried pre-opening an unauthenticated `/v1/authorize`
+    GET first (to open a transaction/cookies), then re-hitting that exact
+    same URL with `&sessionToken=...` appended. This STILL returned status
+    200 with the widget HTML even though the session cookies (JSESSIONID,
+    sid, xids) were present -- proving `/v1/authorize?sessionToken=...` is
+    simply not a supported redemption mechanism for this Identity Engine
+    org, no matter how the transaction/cookies are set up. The correct
+    mechanism (`/login/token/redirect?stateToken=...`) was only discovered
+    from a HAR capture of a real successful login.
 
 Also important: the captured `Authorization: bearer ...` header used by
 MyWater's `/api/mso/data` calls decodes as an Okta **access token** (JWT
@@ -56,7 +71,6 @@ exchange rather than scraping cookies.
 from __future__ import annotations
 
 import logging
-import secrets
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -69,12 +83,10 @@ from .const import (
     OKTA_CLIENT_ID,
     OKTA_ISSUER_PATH,
     OKTA_REDIRECT_URI,
-    OKTA_SCOPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-AUTHORIZE_URL = f"{OKTA_BASE_URL}{OKTA_ISSUER_PATH}/v1/authorize"
 TOKEN_URL = f"{OKTA_BASE_URL}{OKTA_ISSUER_PATH}/v1/token"
 
 _JSON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -112,7 +124,6 @@ class MoAmWaterAuthClient:
 
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
-        self._authorize_url: str | None = None
         self._state_token: str | None = None
         self._factors: list[dict[str, Any]] = []
 
@@ -124,20 +135,6 @@ class MoAmWaterAuthClient:
         async_submit_mfa().
         """
         _LOGGER.debug("Starting MyWater login for user %s", username)
-
-        # Step 1: open the same unauthenticated /v1/authorize transaction the
-        # real browser opens before ever prompting for credentials. This is
-        # what a later sessionToken redemption needs to attach to -- without
-        # it, Okta just re-serves the interactive HTML widget (status 200)
-        # instead of redirecting with a code. We remember the exact URL
-        # (with its `state`) so we hit the identical URL again in step 3.
-        self._authorize_url = self._build_authorize_url()
-        async with self._session.get(self._authorize_url, allow_redirects=True) as resp:
-            await resp.read()
-            _LOGGER.debug(
-                "Initial /v1/authorize GET returned status %s (expected 200 widget page)",
-                resp.status,
-            )
 
         async with self._session.post(
             OKTA_AUTHN_URL,
@@ -203,33 +200,21 @@ class MoAmWaterAuthClient:
 
         return await self._async_finish_with_session_token(session_token)
 
-    def _build_authorize_url(self) -> str:
-        """Build the unauthenticated /v1/authorize URL (no PKCE, matches real browser)."""
-        authorize_params = {
-            "client_id": OKTA_CLIENT_ID,
-            "response_type": "code",
-            "scope": OKTA_SCOPES,
-            "redirect_uri": OKTA_REDIRECT_URI,
-            "state": secrets.token_urlsafe(16),
-        }
-        return f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
+    def _build_token_redirect_url(self, session_token: str) -> str:
+        """Build the `/login/token/redirect?stateToken=...` redemption URL.
+
+        Confirmed via a HAR capture of a real successful login: despite the
+        param being named `stateToken`, the value is the `sessionToken`
+        string returned by `/api/v1/authn` (or its MFA-verify equivalent).
+        This single GET 302-redirects straight to our real `redirect_uri`
+        with `code`/`state` query params -- no prior `/v1/authorize` call
+        or PKCE is involved at all.
+        """
+        return f"{OKTA_BASE_URL}/login/token/redirect?{urlencode({'stateToken': session_token})}"
 
     async def _async_finish_with_session_token(self, session_token: str) -> dict[str, Any]:
-        """Redeem an Okta `sessionToken` for an authorization `code`, then tokens.
-
-        Re-hits the EXACT same /v1/authorize URL (same `state`) opened at the
-        start of async_start_login, now with `sessionToken` appended. Because
-        that URL already opened a transaction (and our aiohttp session kept
-        the resulting cookies), Okta now redirects (302) straight to our
-        `redirect_uri` with a `code` query parameter instead of re-serving
-        the interactive widget HTML.
-        """
-        if not self._authorize_url:
-            raise MoAmWaterAuthError(
-                "No prior /v1/authorize transaction; login was not started correctly"
-            )
-
-        redeem_url = f"{self._authorize_url}&{urlencode({'sessionToken': session_token})}"
+        """Redeem an Okta `sessionToken` via `/login/token/redirect`, then get tokens."""
+        redeem_url = self._build_token_redirect_url(session_token)
 
         code_value = await self._walk_redirects_for_code(redeem_url)
         if not code_value:
