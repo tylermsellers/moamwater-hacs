@@ -200,11 +200,22 @@ class MoAmWaterAuthClient:
             "state": secrets.token_urlsafe(16),
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
-            "sessionToken": session_token,
         }
         authorize_url = f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
 
-        code_value = await self._walk_redirects_for_code(authorize_url)
+        # Passing `sessionToken` directly as a query param on /v1/authorize is
+        # a classic-Okta-only shortcut that Identity Engine (OIE) orgs like
+        # this one do not honor (it just serves the interactive sign-in page,
+        # status 200, instead of redirecting). The correct OIE-compatible way
+        # to redeem a sessionToken is `/login/sessionCookieRedirect`, which
+        # sets an Okta session cookie for us and then 302s into whatever
+        # `redirectUrl` we supply -- so we point it at our /v1/authorize URL.
+        session_redirect_params = {"token": session_token, "redirectUrl": authorize_url}
+        session_redirect_url = (
+            f"{OKTA_BASE_URL}/login/sessionCookieRedirect?{urlencode(session_redirect_params)}"
+        )
+
+        code_value = await self._walk_redirects_for_code(session_redirect_url)
         if not code_value:
             raise MoAmWaterAuthError(
                 "Authorization redirect did not yield a 'code' query parameter"
@@ -221,14 +232,14 @@ class MoAmWaterAuthClient:
         otherwise consume the code server-side before we can read it).
         """
         current_url = url
-        for _ in range(6):
+        for _ in range(8):
             async with self._session.get(current_url, allow_redirects=False) as resp:
                 location = resp.headers.get("Location")
                 body_text = await resp.text()
                 if resp.status not in (301, 302, 303, 307, 308) and not location:
                     raise MoAmWaterAuthError(
-                        f"Expected a redirect from Okta /v1/authorize, got "
-                        f"status {resp.status}: {body_text[:500]}"
+                        f"Expected a redirect from Okta, got status {resp.status} "
+                        f"for {current_url}: {body_text[:300]}"
                     )
 
             candidate = location or str(current_url)
