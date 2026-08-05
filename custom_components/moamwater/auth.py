@@ -83,13 +83,41 @@ from .const import (
     OKTA_CLIENT_ID,
     OKTA_ISSUER_PATH,
     OKTA_REDIRECT_URI,
+    MYWATER_BASE_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 TOKEN_URL = f"{OKTA_BASE_URL}{OKTA_ISSUER_PATH}/v1/token"
 
-_JSON_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
+# Okta's WAF/bot-detection returns a bare 403 for requests that don't look
+# like a real browser (missing User-Agent/Referer/Sec-Fetch-* etc). A real
+# Firefox login was captured returning a clean 302 with these headers
+# present, so we send a realistic browser header set on every request in
+# this flow rather than aiohttp's default (near-empty) headers.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) "
+        "Gecko/20100101 Firefox/153.0"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_BROWSER_NAV_HEADERS = {
+    **_BROWSER_HEADERS,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": f"{MYWATER_BASE_URL}/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+_JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    **_BROWSER_HEADERS,
+}
 
 
 class MoAmWaterAuthError(Exception):
@@ -235,7 +263,9 @@ class MoAmWaterAuthClient:
         current_url = url
         hops: list[str] = []
         for _ in range(8):
-            async with self._session.get(current_url, allow_redirects=False) as resp:
+            async with self._session.get(
+                current_url, allow_redirects=False, headers=_BROWSER_NAV_HEADERS
+            ) as resp:
                 location = resp.headers.get("Location")
                 set_cookie_names = [c.key for c in resp.cookies.values()] if resp.cookies else []
                 body_text = await resp.text()
@@ -283,7 +313,7 @@ class MoAmWaterAuthClient:
         async with self._session.post(
             TOKEN_URL,
             data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={"Content-Type": "application/x-www-form-urlencoded", **_BROWSER_HEADERS},
         ) as resp:
             body_text = await resp.text()
             if resp.status != 200:
