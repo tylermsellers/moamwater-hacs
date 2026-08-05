@@ -232,14 +232,21 @@ class MoAmWaterAuthClient:
         otherwise consume the code server-side before we can read it).
         """
         current_url = url
+        hops: list[str] = []
         for _ in range(8):
             async with self._session.get(current_url, allow_redirects=False) as resp:
                 location = resp.headers.get("Location")
+                set_cookie_names = [c.key for c in resp.cookies.values()] if resp.cookies else []
                 body_text = await resp.text()
+                hops.append(
+                    f"{resp.status} {current_url.split('?')[0]} "
+                    f"(set-cookie: {set_cookie_names or 'none'}, "
+                    f"location: {(location or 'none').split('?')[0]})"
+                )
                 if resp.status not in (301, 302, 303, 307, 308) and not location:
                     raise MoAmWaterAuthError(
-                        f"Expected a redirect from Okta, got status {resp.status} "
-                        f"for {current_url}: {body_text[:300]}"
+                        f"Expected a redirect from Okta, got status {resp.status}. "
+                        f"Hop trace: {' -> '.join(hops)}. Body: {body_text[:200]}"
                     )
 
             candidate = location or str(current_url)
@@ -248,7 +255,9 @@ class MoAmWaterAuthClient:
             error = (query.get("error") or [None])[0]
             if error:
                 error_desc = (query.get("error_description") or [error])[0]
-                raise MoAmWaterAuthError(f"Okta /v1/authorize returned error: {error_desc}")
+                raise MoAmWaterAuthError(
+                    f"Okta returned error: {error_desc}. Hop trace: {' -> '.join(hops)}"
+                )
             if code:
                 return code
 
