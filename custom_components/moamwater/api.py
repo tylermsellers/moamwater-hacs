@@ -46,7 +46,7 @@ class MoAmWaterApiClient:
         self._username = username
         self._password = password
         self._auth = MoAmWaterAuthClient(session)
-        self._mw_id_token: str | None = None
+        self._access_token: str | None = None
 
         self.business_partner_number: str | None = None
         self.connection_contract_number: str | None = None
@@ -56,18 +56,18 @@ class MoAmWaterApiClient:
     async def async_login(self) -> None:
         """Perform the full Okta IDX login. Raises MfaRequired if a code is needed."""
         result = await self._auth.async_start_login(self._username, self._password)
-        self._mw_id_token = result["mw_id_token"]
+        self._access_token = result["access_token"]
 
     async def async_submit_mfa(self, passcode: str) -> None:
         """Complete login after an MFA challenge was raised by async_login()."""
         result = await self._auth.async_submit_mfa(passcode)
-        self._mw_id_token = result["mw_id_token"]
+        self._access_token = result["access_token"]
 
     def _headers(self) -> dict[str, str]:
-        if not self._mw_id_token:
+        if not self._access_token:
             raise MoAmWaterApiError("Not authenticated; call async_login() first")
         return {
-            "Authorization": f"bearer {self._mw_id_token}",
+            "Authorization": f"bearer {self._access_token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
         }

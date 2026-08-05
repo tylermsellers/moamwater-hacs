@@ -20,7 +20,7 @@ from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import MoAmWaterApiClient, MoAmWaterApiError
-from .auth import MfaRequired, MoAmWaterAuthError
+from .auth import InvalidCredentials, InvalidMfaCode, MfaRequired, MoAmWaterAuthError
 from .const import (
     CONF_BUSINESS_PARTNER_NUMBER,
     CONF_CONNECTION_CONTRACT_NUMBER,
@@ -72,9 +72,15 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
                 await self._api.async_login()
             except MfaRequired:
                 return await self.async_step_mfa()
-            except MoAmWaterAuthError as exc:
-                _LOGGER.error("MoAmWater login failed: %s", exc)
+            except InvalidCredentials as exc:
+                _LOGGER.warning("MoAmWater rejected credentials: %s", exc)
                 errors["base"] = "invalid_auth"
+            except MoAmWaterAuthError as exc:
+                # A protocol/implementation failure (not a credential problem) --
+                # log the real cause and show "unknown" so users don't waste
+                # time re-typing a correct password.
+                _LOGGER.error("MoAmWater login failed unexpectedly: %s", exc)
+                errors["base"] = "unknown"
             except MoAmWaterApiError as exc:
                 _LOGGER.error("MoAmWater connection error: %s", exc)
                 errors["base"] = "cannot_connect"
@@ -97,9 +103,14 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
             assert self._api is not None
             try:
                 await self._api.async_submit_mfa(user_input["passcode"])
-            except MoAmWaterAuthError:
+            except InvalidMfaCode as exc:
+                _LOGGER.warning("MoAmWater rejected MFA code: %s", exc)
                 errors["base"] = "invalid_mfa"
-            except MoAmWaterApiError:
+            except MoAmWaterAuthError as exc:
+                _LOGGER.error("MoAmWater MFA failed unexpectedly: %s", exc)
+                errors["base"] = "unknown"
+            except MoAmWaterApiError as exc:
+                _LOGGER.error("MoAmWater connection error: %s", exc)
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected error during MoAmWater MFA")
