@@ -200,6 +200,7 @@ class MoAmWaterAuthClient:
             "state": secrets.token_urlsafe(16),
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
+            "sessionToken": session_token,
         }
         authorize_url = f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
 
@@ -246,7 +247,7 @@ class MoAmWaterAuthClient:
                 if resp.status not in (301, 302, 303, 307, 308) and not location:
                     raise MoAmWaterAuthError(
                         f"Expected a redirect from Okta, got status {resp.status}. "
-                        f"Hop trace: {' -> '.join(hops)}. Body: {body_text[:200]}"
+                        f"Hop trace: {' -> '.join(hops)}. Body: {body_text[:1500]}"
                     )
 
             candidate = location or str(current_url)

@@ -26,7 +26,7 @@ MYWATER_DATA_ENDPOINT = "/api/mso/data"
 OKTA_REDIRECT_URI = f"{MYWATER_BASE_URL}{MYWATER_LOGIN_REDIRECT_PATH}"
 
 # OAuth/OIDC scopes requested by the MyWater SPA (standard Okta SPA defaults).
-OKTA_SCOPES = "openid profile email offline_access"
+OKTA_SCOPES = "openid email profile UserContext offline_access GroupMembership"
 
 # --- MyWater application identifiers (from captured usage request payload) ---
 SOLUTION_ID = "com::amwater::enhancedportal::enhancedportal"
