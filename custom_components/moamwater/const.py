@@ -61,6 +61,17 @@ DATA_ID_TOKEN = "id_token"
 DATA_REFRESH_TOKEN = "refresh_token"
 DATA_EXPIRES_AT = "expires_at"
 
+# Persisted in entry.data so a restart within the token's ~10hr lifetime can
+# skip login entirely instead of re-running the full interactive/SMS flow.
+CONF_ACCESS_TOKEN = "access_token"
+CONF_ACCESS_TOKEN_EXPIRES_AT = "access_token_expires_at"
+
+# Filename (relative to HA's config/.storage dir) used to persist Okta's own
+# session cookies (e.g. `sid`) across restarts, so that even once the access
+# token itself has expired we can try a silent `/v1/authorize` replay (Okta
+# SSO) before falling back to a full interactive login.
+COOKIE_JAR_FILENAME_TEMPLATE = "moamwater_{entry_id}_cookies.pickle"
+
 DEFAULT_SCAN_INTERVAL_MINUTES = 60
 
 STATISTIC_ID = "moamwater:usage"

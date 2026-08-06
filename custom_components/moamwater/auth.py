@@ -50,12 +50,28 @@ sequence, not a shortcut:
           `"success": {"href": "https://.../login/token/redirect?stateToken=..."}`.
 
     8. GET  that `success.href` URL -> 302 redirect straight to our real
-          `redirect_uri` with `code`/`state` query params.
+          `redirect_uri` (https://mywaterv2.amwater.com/openidlogin?code=...
+          &state=...).
 
-    9. POST {OKTA_BASE_URL}{issuer}/v1/token (grant_type=authorization_code,
-          NO PKCE) -> exchanges `code` for the real `access_token` (and a
-          `refresh_token`, since `offline_access` is in our requested scopes)
-          used as the credential for `/api/mso/data`.
+    9. GET  that `openidlogin?code=...` URL. **Critically, the browser never
+          calls Okta's `/v1/token` directly at all** -- confirmed by a full
+          HAR capture containing zero requests to `/v1/token`. Instead,
+          MyWater's own backend (mywaterv2.amwater.com) receives the `code`
+          on this GET, does the authorization_code exchange with Okta
+          server-side, and returns a 302 to `/#/enhancedportal` with the
+          real session established via cookies on ITS OWN response:
+            - `mw-authenticationToken` -- this is the exact bearer token
+              value sent as `Authorization: bearer <this>` on every
+              `/api/mso/data` call (verified byte-for-byte equal in the HAR).
+            - `mw_refresh_token` -- an opaque ~43-char MyWater-issued
+              refresh token (NOT an Okta refresh_token), scoped to
+              Domain=amwater.com.
+            - `mw_id_token`, `JSESSIONID`, `ATMOSPHEREID`, `SESSION` -- also
+              set, but not needed for our API calls.
+          So this client follows the redirect chain all the way through to
+          THIS response (rather than stopping at the `code` query param) and
+          reads `mw-authenticationToken`/`mw_refresh_token` straight out of
+          its Set-Cookie headers.
 
 IMPORTANT history of failed approaches (do not repeat these mistakes):
   - Interaction Code / `/v1/interact` flow: this Okta app registration's
@@ -80,16 +96,52 @@ IMPORTANT history of failed approaches (do not repeat these mistakes):
     logins never call `/api/v1/authn`, they go through `/idp/idx/*`. The
     403 was Okta's WAF rejecting a session that skipped the real IDX
     handshake steps entirely, not a header-fidelity problem.
+  - After correctly implementing the full IDX handshake through step 8, this
+    client tried POSTing `code` to Okta's own `{issuer}/v1/token` directly
+    (matching the OAuth2 authorization_code spec) -- Okta rejected this with
+    `401 invalid_client: Client authentication failed`. This is because the
+    MyWater Okta app is registered as a CONFIDENTIAL client (needs a client
+    secret we don't have and never will, since the SPA itself never calls
+    this endpoint) -- the token exchange is done server-side by MyWater's
+    own backend when the code is redeemed at `/openidlogin?code=...`, not by
+    the browser/SPA. Confirmed via HAR: zero `/v1/token` requests appear
+    anywhere in a full captured login session.
 
 Also important: the captured `Authorization: bearer ...` header used by
-MyWater's `/api/mso/data` calls decodes as an Okta **access token** (JWT
-claims `cid`, `uid`, `scp`), which is a *different* token from the
-`mw_id_token` cookie (JWT claims `sub`, `name`, `email` -- an **ID token**).
-This client requests the access_token directly from the `/v1/token`
-exchange rather than scraping cookies.
+MyWater's `/api/mso/data` calls is IDENTICAL to the `mw-authenticationToken`
+cookie value set by MyWater's backend on the `/openidlogin?code=...`
+response (verified byte-for-byte in the HAR) -- NOT an Okta access_token
+obtained via `/v1/token` (that endpoint is never called by this client).
+
+Avoiding reauth on every HA restart
+-----------------------------------
+A real browser never re-types a password/SMS code on every visit either --
+it relies on two layers of persistence, both of which this integration now
+mirrors:
+  1. The `mw-authenticationToken` JWT itself is valid for ~10 hours (`exp` -
+     `iat` in its payload). Most HA restarts are far shorter than that, so
+     simply persisting the token + its `exp` claim into the config entry and
+     skipping login entirely while it's still valid (see api.py's
+     `async_login()`) avoids essentially all normal-restart reauths.
+  2. For restarts (or outages) that DO outlast that ~10hr window, Okta's own
+     `/v1/authorize` endpoint recognizes an existing, still-valid Okta
+     session (via its own session cookies, e.g. `sid`) and redirects
+     straight through to a fresh `code` WITHOUT showing the interactive
+     widget at all -- this is the same SSO mechanism that lets a real user
+     revisit the site without re-entering credentials. Because this
+     integration uses a dedicated, persisted `aiohttp.ClientSession`
+     (its cookie jar saved to disk in HA's storage dir on unload/shutdown
+     and reloaded on setup -- see `__init__.py`), those Okta session cookies
+     survive HA restarts too, so `async_try_silent_sso()` can often succeed
+     even after the access_token has expired. Only when Okta's own session
+     has ALSO expired (i.e. its cookie's server-side TTL, observed to be
+     considerably longer than the ~10hr JWT, has lapsed) does this
+     integration fall back to a full interactive login requiring a new SMS
+     code -- and even then, only genuinely necessary.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -150,6 +202,32 @@ _IDX_HEADERS = {
 
 _STATE_TOKEN_RE = re.compile(r'"stateToken"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
+# Cookies Okta sets on the initial `/v1/authorize` GET that represent its own
+# authenticated browser session (distinct from MyWater's own session
+# cookies). If these are still valid on a later `/v1/authorize` GET, Okta
+# recognizes the existing session and redirects straight through to a `code`
+# without showing the interactive widget (standard OIDC/SSO "remember this
+# browser" behavior) -- letting us skip password + SMS entirely.
+OKTA_SESSION_COOKIE_NAMES = ("sid", "JSESSIONID", "t", "DT", "xids")
+
+
+def decode_jwt_exp(token: str) -> float | None:
+    """Return the `exp` (epoch seconds) claim from a JWT, or None if undecodable.
+
+    Used to know how much longer a stored `mw-authenticationToken` is valid
+    for, without needing to verify its signature (we don't have Okta's
+    public key and don't need to -- MyWater's own API will reject it if it's
+    actually invalid).
+    """
+    try:
+        payload_b64 = token.split(".")[1]
+        padding = "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+        exp = payload.get("exp")
+        return float(exp) if exp is not None else None
+    except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
 
 class MoAmWaterAuthError(Exception):
     """Raised when authentication with Okta/MyWater fails for a protocol/implementation reason.
@@ -203,6 +281,53 @@ class MoAmWaterAuthClient:
         response = await self._async_identify(username)
         response = await self._async_answer_password(password, response)
         return await self._async_handle_remediation(response)
+
+    async def async_try_silent_sso(self) -> dict[str, Any] | None:
+        """Attempt to obtain fresh tokens without any user interaction, by
+        replaying `/v1/authorize` and hoping Okta's own session cookies
+        (persisted in `self._session.cookie_jar` from a prior login) are
+        still valid.
+
+        If Okta still recognizes the browser session, `/v1/authorize`
+        redirects straight through to our `redirect_uri` with a `code`
+        (skipping the interactive widget entirely) -- in that case we walk
+        the redirect chain the same way as a normal login's `success.href`
+        and return a fresh token dict. Returns None (never raises, except on
+        genuine network errors) if Okta's session has actually expired and
+        the widget HTML is shown instead, so the caller can fall back to a
+        full interactive login.
+        """
+        authorize_params = {
+            "client_id": OKTA_CLIENT_ID,
+            "response_type": "code",
+            "scope": OKTA_SCOPES,
+            "redirect_uri": OKTA_REDIRECT_URI,
+            "state": secrets.token_urlsafe(16),
+        }
+        url = f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
+        try:
+            async with self._session.get(
+                url, headers=_BROWSER_NAV_HEADERS, allow_redirects=False
+            ) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location")
+                    if not location:
+                        return None
+                    _LOGGER.debug("Silent SSO: /v1/authorize redirected immediately, following chain")
+                    return await self._walk_redirects_for_mywater_tokens(location)
+
+                # A 200 here means Okta didn't recognize the session and
+                # served the interactive Sign-In Widget HTML instead --
+                # session expired, must fall back to full interactive login.
+                _LOGGER.debug(
+                    "Silent SSO: /v1/authorize returned status %s (no redirect); "
+                    "Okta session has expired",
+                    resp.status,
+                )
+                return None
+        except (MoAmWaterAuthError, aiohttp.ClientError) as exc:
+            _LOGGER.debug("Silent SSO attempt failed: %s", exc)
+            return None
 
     async def async_submit_mfa(self, passcode: str) -> dict[str, Any]:
         """Submit the MFA passcode (SMS/email/TOTP code) to complete login."""
@@ -367,23 +492,24 @@ class MoAmWaterAuthClient:
         )
 
     async def _async_finish_from_success_href(self, href: str) -> dict[str, Any]:
-        """Follow the `success.href` (the real `/login/token/redirect?stateToken=...`
-        URL returned by Okta) to get our authorization `code`, then exchange it.
+        """Follow the `success.href` redirect chain all the way through
+        MyWater's own `/openidlogin?code=...` redemption, then read the real
+        session tokens straight out of the Set-Cookie headers on that final
+        response (see module docstring step 9 -- Okta's `/v1/token` is never
+        called at all in the real flow).
         """
-        code_value = await self._walk_redirects_for_code(href)
-        if not code_value:
-            raise MoAmWaterAuthError(
-                "Authorization redirect did not yield a 'code' query parameter"
-            )
-        tokens = await self._exchange_code_for_tokens(code_value)
-        return {"access_token": tokens["access_token"], "refresh_token": tokens.get("refresh_token")}
+        return await self._walk_redirects_for_mywater_tokens(href)
 
-    async def _walk_redirects_for_code(self, url: str) -> str | None:
-        """Manually follow a redirect chain, extracting the `code` query param.
+    async def _walk_redirects_for_mywater_tokens(self, url: str) -> dict[str, Any]:
+        """Manually follow the full redirect chain from Okta's success href
+        through to MyWater's own `/openidlogin?code=...&state=...` request,
+        and return the `mw-authenticationToken`/`mw_refresh_token` cookies
+        MyWater's backend sets on that response.
 
-        Stops as soon as a hop's Location carries a `code` param, without
-        letting aiohttp auto-follow past that point (MyWater's backend would
-        otherwise consume the code server-side before we can read it).
+        We must follow every hop ourselves (not let aiohttp auto-follow)
+        since the final hop's tokens live in Set-Cookie headers on a 302
+        response, which aiohttp would otherwise swallow while chasing the
+        Location header further.
         """
         current_url = url
         hops: list[str] = []
@@ -392,97 +518,60 @@ class MoAmWaterAuthClient:
                 current_url, allow_redirects=False, headers=_BROWSER_NAV_HEADERS
             ) as resp:
                 location = resp.headers.get("Location")
-                set_cookie_names = [c.key for c in resp.cookies.values()] if resp.cookies else []
+                cookies = {c.key: c.value for c in resp.cookies.values()} if resp.cookies else {}
                 body_text = await resp.text()
                 hops.append(
                     f"{resp.status} {current_url.split('?')[0]} "
-                    f"(set-cookie: {set_cookie_names or 'none'}, "
+                    f"(set-cookie: {list(cookies) or 'none'}, "
                     f"location: {(location or 'none').split('?')[0]})"
                 )
+
+                if "mw-authenticationToken" in cookies:
+                    return {
+                        "access_token": cookies["mw-authenticationToken"],
+                        "refresh_token": cookies.get("mw_refresh_token"),
+                    }
+
                 if resp.status not in (301, 302, 303, 307, 308) and not location:
                     raise MoAmWaterAuthError(
-                        f"Expected a redirect from Okta, got status {resp.status}. "
-                        f"Hop trace: {' -> '.join(hops)}. Body: {body_text[:1500]}"
+                        f"Expected a redirect, got status {resp.status} without the "
+                        f"mw-authenticationToken cookie. Hop trace: {' -> '.join(hops)}. "
+                        f"Body: {body_text[:1500]}"
                     )
 
             candidate = location or str(current_url)
             query = parse_qs(urlparse(candidate).query)
-            code = (query.get("code") or [None])[0]
             error = (query.get("error") or [None])[0]
             if error:
                 error_desc = (query.get("error_description") or [error])[0]
                 raise MoAmWaterAuthError(
                     f"Okta returned error: {error_desc}. Hop trace: {' -> '.join(hops)}"
                 )
-            if code:
-                return code
 
             if not location:
                 break
             current_url = location
 
-        return None
-
-    async def _exchange_code_for_tokens(self, code: str) -> dict[str, Any]:
-        """POST {issuer}/v1/token to exchange our authorization code for tokens.
-
-        No PKCE `code_verifier` is sent -- the real browser's /v1/authorize
-        request never included a `code_challenge`, so none is expected here.
-        """
-        payload = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "client_id": OKTA_CLIENT_ID,
-            "redirect_uri": OKTA_REDIRECT_URI,
-        }
-        async with self._session.post(
-            TOKEN_URL,
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded", **_BROWSER_HEADERS},
-        ) as resp:
-            body_text = await resp.text()
-            if resp.status != 200:
-                raise MoAmWaterAuthError(
-                    f"Okta /v1/token exchange failed (status {resp.status}): {body_text[:500]}"
-                )
-            data = await resp.json(content_type=None)
-
-        if "access_token" not in data:
-            raise MoAmWaterAuthError(f"Token exchange response missing access_token: {data}")
-        return data
+        raise MoAmWaterAuthError(
+            f"Redirect chain never yielded the mw-authenticationToken cookie. "
+            f"Hop trace: {' -> '.join(hops)}"
+        )
 
 
-async def async_refresh_access_token(
-    session: aiohttp.ClientSession, refresh_token: str
-) -> dict[str, Any]:
-    """Redeem a stored Okta `refresh_token` for a fresh `access_token`.
-
-    Used on every restart/renewal after the initial interactive login, via
-    `grant_type=refresh_token` -- an allowed grant for this Okta client.
-    Okta typically rotates the refresh_token on each redemption -- callers
-    MUST persist the new `refresh_token` value from the returned dict.
+def async_refresh_access_token(*_args: Any, **_kwargs: Any) -> Any:
+    """Removed: MyWater's Okta app is a confidential OAuth client (needs a
+    client secret we don't have), so `grant_type=refresh_token` against
+    Okta's `/v1/token` fails with the same `401 invalid_client` error as the
+    `authorization_code` exchange did (see module docstring). There is also
+    no MyWater-side endpoint for redeeming `mw_refresh_token` captured in
+    any HAR so far. Kept as a stub (rather than deleting outright) so any
+    stale imports fail loudly instead of silently; callers should always
+    fall back to a full interactive login via `MoAmWaterAuthClient` instead.
     """
-    payload = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": OKTA_CLIENT_ID,
-        "scope": OKTA_SCOPES,
-    }
-    async with session.post(
-        TOKEN_URL,
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded", **_BROWSER_HEADERS},
-    ) as resp:
-        body_text = await resp.text()
-        if resp.status != 200:
-            raise MoAmWaterAuthError(
-                f"Okta refresh_token exchange failed (status {resp.status}): {body_text[:500]}"
-            )
-        data = await resp.json(content_type=None)
-
-    if "access_token" not in data:
-        raise MoAmWaterAuthError(f"Refresh response missing access_token: {data}")
-    return data
+    raise MoAmWaterAuthError(
+        "Token refresh is not supported for this Okta app (confidential client); "
+        "perform a full interactive login instead"
+    )
 
 
 def _unescape_js_hex(js_literal: str) -> str:

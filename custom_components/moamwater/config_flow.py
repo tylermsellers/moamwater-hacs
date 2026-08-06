@@ -8,20 +8,28 @@ Two-step flow to support Okta MFA:
        `self._api` and move to the `mfa` step.
   2. `mfa` step — collect the one-time passcode (SMS/email/TOTP), submit it,
      then discover the account and create the entry.
+
+Uses a dedicated `aiohttp.ClientSession` (not HA's shared one) for the same
+reason `__init__.py` does: we need our own cookie jar so Okta's session
+cookies from this very first login can be saved to disk immediately and
+reused by `async_setup_entry()` on the first restart (see auth.py's module
+docstring for the full reauth-avoidance strategy).
 """
 from __future__ import annotations
 
 import logging
 from typing import Any
 
+import aiohttp
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import MoAmWaterApiClient, MoAmWaterApiError
 from .auth import InvalidCredentials, InvalidMfaCode, MfaRequired, MoAmWaterAuthError
 from .const import (
+    CONF_ACCESS_TOKEN,
+    CONF_ACCESS_TOKEN_EXPIRES_AT,
     CONF_BUSINESS_PARTNER_NUMBER,
     CONF_CONNECTION_CONTRACT_NUMBER,
     CONF_PASSWORD,
@@ -66,7 +74,12 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._username = user_input[CONF_USERNAME]
             self._password = user_input[CONF_PASSWORD]
-            session = async_get_clientsession(self.hass)
+            # A throwaway session used only during the config flow -- its
+            # cookie jar isn't persisted here; `async_setup_entry()` creates
+            # the real long-lived session/cookie jar for actual operation.
+            # Login here only needs to succeed once to discover the account
+            # and capture initial access_token/refresh_token values.
+            session = aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))
             self._api = MoAmWaterApiClient(session, self._username, self._password)
 
             try:
@@ -135,15 +148,22 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         await self.async_set_unique_id(self._api.connection_contract_number)
         self._abort_if_unique_id_configured()
 
-        return self.async_create_entry(
+        entry = self.async_create_entry(
             title=f"MyWater ({self._username})",
             data={
                 CONF_USERNAME: self._username,
                 CONF_PASSWORD: self._password,
                 CONF_REFRESH_TOKEN: self._api.refresh_token,
+                CONF_ACCESS_TOKEN: self._api.access_token,
+                CONF_ACCESS_TOKEN_EXPIRES_AT: self._api.access_token_expires_at,
                 CONF_BUSINESS_PARTNER_NUMBER: self._api.business_partner_number,
                 CONF_CONNECTION_CONTRACT_NUMBER: self._api.connection_contract_number,
                 CONF_PREMISE_ID: self._api.premise_id,
                 CONF_STATE_CODE: self._api.state_code,
             },
         )
+        # The throwaway session from async_step_user isn't needed anymore --
+        # async_setup_entry() will create its own persisted-cookie-jar session.
+        await self._api._session.close()  # noqa: SLF001
+        return entry
+

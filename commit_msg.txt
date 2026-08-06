@@ -1,0 +1,43 @@
+v0.4.0: Fix invalid_client token exchange + avoid reauth on every HA restart
+
+Two changes bundled together since the second depends on the first working
+end-to-end:
+
+1. Fix Okta token exchange (401 invalid_client)
+   Discovered via a full HAR capture that MyWater's Okta app is registered
+   as a CONFIDENTIAL OAuth client -- the browser/SPA never calls Okta's
+   `/v1/token` at all. Instead, after the IDX login sequence completes and
+   redirects to `success.href`, the real flow follows that redirect chain
+   all the way through to MyWater's own `/openidlogin?code=...` endpoint,
+   which does the code exchange server-side and returns the actual session
+   tokens (`mw-authenticationToken`, `mw_refresh_token`) as cookies on its
+   own 302 response. auth.py now follows the full redirect chain manually
+   and extracts these cookies directly instead of POSTing to `/v1/token`.
+
+2. Avoid full reauthentication (password + SMS) on every HA restart
+   Previously every setup/restart discarded the working session and ran
+   the full interactive IDX + SMS challenge from scratch. Now a 3-tier
+   strategy is used:
+     a. If the stored `mw-authenticationToken` (persisted in entry.data,
+        along with its decoded `exp` claim) hasn't expired yet, skip login
+        entirely and reuse it. The token is valid ~10 hours, so this alone
+        covers the overwhelming majority of HA restarts.
+     b. Otherwise, attempt a silent Okta SSO replay of `/v1/authorize`.
+        Okta's own session cookies (e.g. `sid`) are recognized across
+        requests just like a real browser's "remember this session"
+        behavior -- if still valid, `/v1/authorize` redirects straight to a
+        fresh `code` with no interactive widget shown at all, letting a
+        brand new access_token be minted with zero user interaction. To
+        make this possible across restarts, the integration now uses its
+        own dedicated `aiohttp.ClientSession` (rather than HA's shared one)
+        whose cookie jar is persisted to disk in HA's `.storage` dir on
+        unload/shutdown and restored on setup.
+     c. Only if both (a) and (b) fail -- meaning Okta's own session has
+        also genuinely expired -- does the integration fall back to the
+        full interactive login, raising MfaRequired/ConfigEntryAuthFailed
+        so the user is prompted for a fresh SMS code via the reauth flow.
+   The same 401-triggered silent-SSO fallback now also runs mid-session
+   (in api.py's `_post()`) if a poll's access_token happens to expire
+   between restarts, before giving up and surfacing an error.
+
+Files changed: auth.py, api.py, __init__.py, config_flow.py, const.py.

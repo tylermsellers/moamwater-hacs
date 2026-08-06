@@ -8,11 +8,12 @@ payload identifying the account (businessPartnerNumber / connectionContractNumbe
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import aiohttp
 
-from .auth import MoAmWaterAuthClient, MfaRequired, async_refresh_access_token
+from .auth import MoAmWaterAuthClient, MfaRequired, decode_jwt_exp
 from .const import (
     APPLICATION_ID,
     MICRO_APP_DAILY,
@@ -33,6 +34,10 @@ class MoAmWaterApiError(Exception):
     """Raised for any non-auth API failure (network error, unexpected shape)."""
 
 
+class _Unauthorized(Exception):
+    """Internal sentinel: the MSO endpoint returned 401 for the current access_token."""
+
+
 class MoAmWaterApiClient:
     """Thin async client for MyWater's usage/account MSO endpoints."""
 
@@ -42,12 +47,15 @@ class MoAmWaterApiClient:
         username: str,
         password: str,
         refresh_token: str | None = None,
+        access_token: str | None = None,
+        access_token_expires_at: float | None = None,
     ) -> None:
         self._session = session
         self._username = username
         self._password = password
         self._auth = MoAmWaterAuthClient(session)
-        self._access_token: str | None = None
+        self._access_token: str | None = access_token
+        self._access_token_expires_at: float | None = access_token_expires_at
         self.refresh_token: str | None = refresh_token
 
         self.business_partner_number: str | None = None
@@ -55,30 +63,57 @@ class MoAmWaterApiClient:
         self.premise_id: str | None = None
         self.state_code: str = "MO"
 
-    async def async_login(self) -> None:
-        """Log in, preferring a stored `refresh_token` over interactive login.
+    @property
+    def access_token(self) -> str | None:
+        return self._access_token
 
-        A stored refresh_token (obtained once via a real browser login) is
-        the ONLY reliable path -- see auth.py's module docstring for why
-        automating the interactive Okta Sign-In Widget login from scratch
-        does not work (WAF blocks). Falls back to the interactive IDX flow
-        (which may raise MfaRequired) only if no refresh_token is stored yet.
+    @property
+    def access_token_expires_at(self) -> float | None:
+        return self._access_token_expires_at
+
+    def _store_tokens(self, result: dict[str, Any]) -> None:
+        self._access_token = result["access_token"]
+        self.refresh_token = result.get("refresh_token") or self.refresh_token
+        self._access_token_expires_at = decode_jwt_exp(self._access_token)
+
+    async def async_login(self) -> None:
+        """Log in, avoiding a full interactive (password + SMS) login whenever possible.
+
+        Three-tier strategy, in order of preference:
+          1. If we already hold an access_token that hasn't expired yet
+             (with a safety margin), skip login entirely and keep using it.
+             This is what makes most HA restarts (which are far shorter than
+             the ~10hr token lifetime) require no reauth at all.
+          2. Otherwise, try a silent SSO replay of `/v1/authorize`: if Okta's
+             own session cookies (persisted in the shared aiohttp session's
+             cookie jar) are still valid, Okta redirects straight through to
+             a fresh `code` without showing the interactive widget, letting
+             us mint a new access_token with zero user interaction even
+             after the access_token itself has expired.
+          3. Only if both of those fail (Okta's own session has *also*
+             expired) do we fall back to a full interactive login, which
+             raises MfaRequired so the caller can prompt for a new SMS code.
         """
-        if self.refresh_token:
-            result = await async_refresh_access_token(self._session, self.refresh_token)
-            self._access_token = result["access_token"]
-            self.refresh_token = result.get("refresh_token", self.refresh_token)
+        if self._access_token and self._access_token_expires_at:
+            # 5 minute safety margin so we don't start a poll cycle with a
+            # token that expires mid-request.
+            if self._access_token_expires_at - time.time() > 300:
+                _LOGGER.debug("Reusing stored MyWater access_token (not yet expired)")
+                return
+
+        sso_result = await self._auth.async_try_silent_sso()
+        if sso_result is not None:
+            _LOGGER.debug("MyWater login completed via silent Okta SSO replay (no reauth needed)")
+            self._store_tokens(sso_result)
             return
 
         result = await self._auth.async_start_login(self._username, self._password)
-        self._access_token = result["access_token"]
-        self.refresh_token = result.get("refresh_token") or self.refresh_token
+        self._store_tokens(result)
 
     async def async_submit_mfa(self, passcode: str) -> None:
         """Complete login after an MFA challenge was raised by async_login()."""
         result = await self._auth.async_submit_mfa(passcode)
-        self._access_token = result["access_token"]
-        self.refresh_token = result.get("refresh_token") or self.refresh_token
+        self._store_tokens(result)
 
     def _headers(self) -> dict[str, str]:
         if not self._access_token:
@@ -91,19 +126,31 @@ class MoAmWaterApiClient:
 
     async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         try:
+            return await self._post_once(payload)
+        except _Unauthorized:
+            # The access_token expired mid-session (poll interval can span
+            # hours). Try a silent Okta SSO replay before giving up -- this
+            # avoids surfacing MfaRequired for something that's often
+            # recoverable with zero user interaction (see async_login()).
+            _LOGGER.debug("MyWater request got 401; attempting silent SSO relogin")
+            sso_result = await self._auth.async_try_silent_sso()
+            if sso_result is None:
+                raise MoAmWaterApiError(
+                    "MyWater session expired; re-authentication (with a new SMS code) is required"
+                )
+            self._store_tokens(sso_result)
+            try:
+                return await self._post_once(payload)
+            except _Unauthorized as exc:
+                raise MoAmWaterApiError(
+                    "MyWater session expired; re-authentication (with a new SMS code) is required"
+                ) from exc
+
+    async def _post_once(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
             async with self._session.post(DATA_URL, json=payload, headers=self._headers()) as resp:
                 if resp.status == 401:
-                    # Access tokens are short-lived; re-derive a fresh one
-                    # from our stored refresh_token and retry once before
-                    # giving up (avoids forcing reauth every polling cycle).
-                    if not self.refresh_token:
-                        raise MoAmWaterApiError("Session expired; re-authentication required")
-                    await self.async_login()
-                    async with self._session.post(
-                        DATA_URL, json=payload, headers=self._headers()
-                    ) as retry_resp:
-                        retry_resp.raise_for_status()
-                        return await retry_resp.json(content_type=None)
+                    raise _Unauthorized()
                 resp.raise_for_status()
                 return await resp.json(content_type=None)
         except aiohttp.ClientError as exc:
