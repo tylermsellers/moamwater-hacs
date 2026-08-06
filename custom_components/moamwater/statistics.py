@@ -91,7 +91,10 @@ def _parse_category_date(category: str):
     (e.g. "Jul-21", confirmed from the live portal's 30-day chart) and
     space-separated (e.g. "Jul 21") forms have been seen.
     """
-    now = dt_util.now()
+    # Use a naive "now" for comparisons since strptime() without "%Y" always
+    # produces a naive datetime -- comparing naive to timezone-aware raises
+    # TypeError.
+    now = dt_util.now().replace(tzinfo=None)
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%b-%d", "%b %d", "%m/%d"):
         try:
             parsed = datetime.strptime(category, fmt)
