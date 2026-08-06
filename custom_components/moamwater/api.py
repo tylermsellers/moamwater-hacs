@@ -28,6 +28,8 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 DATA_URL = f"{MYWATER_BASE_URL}{MYWATER_DATA_ENDPOINT}"
+PIPELINE_ACCOUNT_SUMMARY = "com::apporchid::cloudseer::mso::myaccountsummarypipeline"
+PIPELINE_CUSTOMER_PROFILE = "com::apporchid::cloudseer::mso::customer_profile_pipeline"
 
 
 class MoAmWaterApiError(Exception):
@@ -153,13 +155,25 @@ class MoAmWaterApiClient:
                     raise _Unauthorized()
                 if resp.status >= 400:
                     body = await resp.text()
+                    request_name = payload.get("microApplicationId") or payload.get("pipelineId")
                     raise MoAmWaterApiError(
-                        f"MyWater API HTTP {resp.status} for {payload.get('microApplicationId')}: "
+                        f"MyWater API HTTP {resp.status} for {request_name}: "
                         f"{body[:500] or '(empty body)'}"
                     )
                 return await resp.json(content_type=None)
         except aiohttp.ClientError as exc:
             raise MoAmWaterApiError(f"Request to MyWater failed: {exc}") from exc
+
+    @staticmethod
+    def _pipeline_payload(pipeline_id: str, key_value_map: dict[str, Any]) -> dict[str, Any]:
+        """Build the PipelineServiceModel request shape expected by /api/mso/data."""
+        return {
+            "pipelineId": pipeline_id,
+            "requestParameters": {
+                "@class": "com.apporchid.common.UIRequestParameters",
+                "keyValueMap": key_value_map,
+            },
+        }
 
     async def async_discover_account(self) -> None:
         """Fetch the customer profile pipeline to learn account identifiers.
@@ -168,31 +182,51 @@ class MoAmWaterApiClient:
         which returns the businessPartnerNumber / connectionContractNumber /
         premiseId needed for every subsequent usage request.
         """
-        payload = {
-            "applicationId": "com::amwater::enhancedportal::customerprofile",
-            "solutionId": SOLUTION_ID,
-            "solutionPageId": SOLUTION_PAGE_ID,
-            "microApplicationId": "customer_profile_pipeline",
-            "renderType": "DATA",
-        }
-        data = await self._post(payload)
-        records = data.get("data") or []
-        if not records:
-            raise MoAmWaterApiError("Customer profile lookup returned no records")
-        record = records[0]
-        self.business_partner_number = record.get("businessPartnerNumber") or record.get(
-            "BusinessPartnerNumber"
+        summary = await self._post(
+            self._pipeline_payload(PIPELINE_ACCOUNT_SUMMARY, {"queryParams": None})
         )
-        self.connection_contract_number = record.get("connectionContractNumber") or record.get(
-            "ConnectionContractNumber"
-        )
-        self.premise_id = record.get("premiseId") or record.get("PremiseId")
-        self.state_code = record.get("stateCode") or record.get("premiseStateCode") or "MO"
+        summary_rows = summary.get("data") or []
+        if not summary_rows:
+            raise MoAmWaterApiError("Account summary lookup returned no records")
+
+        first = summary_rows[0]
+        info = (first.get("additionalInformation") or {}).get("IntermediaryPageDetails") or []
+        details = info[0] if info else {}
+        self.business_partner_number = details.get("businessPartnerNumber")
+        # API expects this field name, but the account-summary payload calls it
+        # contractAccountNumber.
+        self.connection_contract_number = details.get("contractAccountNumber")
+        # API expects premiseId; account summary returns premiseNumber.
+        self.premise_id = details.get("premiseNumber")
+        self.state_code = details.get("state") or "MO"
 
         if not all([self.business_partner_number, self.connection_contract_number, self.premise_id]):
             raise MoAmWaterApiError(
-                f"Could not determine account identifiers from profile response: {record}"
+                "Could not determine account identifiers from account summary response"
             )
+
+        # Validate identifiers against the profile pipeline used by the portal.
+        profile = await self._post(
+            self._pipeline_payload(
+                PIPELINE_CUSTOMER_PROFILE,
+                {
+                    "queryParams": {
+                        "businessPartnerNumber": self.business_partner_number,
+                        "connectionContractNumber": self.connection_contract_number,
+                        "premiseId": self.premise_id,
+                    }
+                },
+            )
+        )
+        profile_rows = profile.get("data") or []
+        if profile_rows:
+            rec = profile_rows[0]
+            self.business_partner_number = rec.get("businessPartnerNumber") or self.business_partner_number
+            self.connection_contract_number = (
+                rec.get("connectionContractNumber") or self.connection_contract_number
+            )
+            self.premise_id = rec.get("premiseId") or self.premise_id
+            self.state_code = rec.get("stateCode") or rec.get("premiseStateCode") or self.state_code
 
     def _usage_payload(self, micro_app_id: str, days: str = "") -> dict[str, Any]:
         return {
