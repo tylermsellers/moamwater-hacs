@@ -27,6 +27,7 @@ OKTA_TOKEN_REDIRECT_URL = f"{OKTA_BASE_URL}/login/token/redirect"
 MYWATER_BASE_URL = "https://mywaterv2.amwater.com"
 MYWATER_LOGIN_REDIRECT_PATH = "/openidlogin"
 MYWATER_DATA_ENDPOINT = "/api/mso/data"
+MYWATER_MICROAPP_ENDPOINT = "/api/vux/microapp"
 
 # Redirect URI the MyWater SPA registers with Okta (captured from network trace).
 # Must match exactly what Okta expects for the authorization code exchange.

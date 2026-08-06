@@ -21,6 +21,7 @@ from .const import (
     MICRO_APP_MONTHLY_12,
     MYWATER_BASE_URL,
     MYWATER_DATA_ENDPOINT,
+    MYWATER_MICROAPP_ENDPOINT,
     SOLUTION_ID,
     SOLUTION_PAGE_ID,
 )
@@ -28,6 +29,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 DATA_URL = f"{MYWATER_BASE_URL}{MYWATER_DATA_ENDPOINT}"
+MICROAPP_URL = f"{MYWATER_BASE_URL}{MYWATER_MICROAPP_ENDPOINT}"
 PIPELINE_ACCOUNT_SUMMARY = "com::apporchid::cloudseer::mso::myaccountsummarypipeline"
 PIPELINE_CUSTOMER_PROFILE = "com::apporchid::cloudseer::mso::customer_profile_pipeline"
 
@@ -126,9 +128,9 @@ class MoAmWaterApiClient:
             "Accept": "application/json, text/plain, */*",
         }
 
-    async def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _post(self, payload: dict[str, Any], *, url: str = DATA_URL) -> dict[str, Any]:
         try:
-            return await self._post_once(payload)
+            return await self._post_once(payload, url=url)
         except _Unauthorized:
             # The access_token expired mid-session (poll interval can span
             # hours). Try a silent Okta SSO replay before giving up -- this
@@ -142,22 +144,22 @@ class MoAmWaterApiClient:
                 )
             self._store_tokens(sso_result)
             try:
-                return await self._post_once(payload)
+                return await self._post_once(payload, url=url)
             except _Unauthorized as exc:
                 raise MoAmWaterApiError(
                     "MyWater session expired; re-authentication (with a new SMS code) is required"
                 ) from exc
 
-    async def _post_once(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _post_once(self, payload: dict[str, Any], *, url: str = DATA_URL) -> dict[str, Any]:
         try:
-            async with self._session.post(DATA_URL, json=payload, headers=self._headers()) as resp:
+            async with self._session.post(url, json=payload, headers=self._headers()) as resp:
                 if resp.status == 401:
                     raise _Unauthorized()
                 if resp.status >= 400:
                     body = await resp.text()
                     request_name = payload.get("microApplicationId") or payload.get("pipelineId")
                     raise MoAmWaterApiError(
-                        f"MyWater API HTTP {resp.status} for {request_name}: "
+                        f"MyWater API HTTP {resp.status} for {request_name} ({url}): "
                         f"{body[:500] or '(empty body)'}"
                     )
                 return await resp.json(content_type=None)
@@ -229,26 +231,46 @@ class MoAmWaterApiClient:
             self.state_code = rec.get("stateCode") or rec.get("premiseStateCode") or self.state_code
 
     def _usage_payload(self, micro_app_id: str, days: str = "") -> dict[str, Any]:
+        selected_val = ""
+        if micro_app_id != MICRO_APP_HOURLY and days:
+            selected_val = days
+
         return {
-            "applicationId": APPLICATION_ID,
             "solutionId": SOLUTION_ID,
-            "solutionPageId": SOLUTION_PAGE_ID,
+            "applicationId": APPLICATION_ID,
             "microApplicationId": micro_app_id,
+            "solutionPageId": SOLUTION_PAGE_ID,
             "renderType": "CONFIG_AND_DATA",
-            "businessPartnerNumber": self.business_partner_number,
-            "connectionContractNumber": self.connection_contract_number,
-            "premiseId": self.premise_id,
-            "premiseStateCode": self.state_code,
-            "stateCode": self.state_code,
-            "regionName": self.state_code,
-            "accountType": "",
-            "billMonth": "",
-            "days": days,
-            "endDate": "",
-            "startDate": "",
-            "limitRecords": 2,
-            "serviceUrl": "",
-            "source": "",
+            "userOptions": {
+                "@class": "com.apporchid.vulcanux.common.ui.data.UserOptions",
+                "locale": "en-US",
+                "timeZone": "America/Chicago",
+                "screenWidth": 1920,
+                "screenHeight": 1080,
+                "orientation": 0,
+                "orientationType": "Portrait",
+            },
+            "keyValueMap": {
+                "queryParams": {
+                    "businessPartnerNumber": self.business_partner_number,
+                    "connectionContractNumber": self.connection_contract_number,
+                    "premiseId": self.premise_id,
+                    "billMonth": "",
+                    "limitRecords": 2,
+                    "regionName": self.state_code,
+                    "startDate": "",
+                    "endDate": "",
+                    "source": "",
+                    "premiseStateCode": self.state_code,
+                    "stateCode": self.state_code,
+                    "serviceUrl": "",
+                    "accountType": "",
+                    "days": days,
+                    "selectedVal": selected_val,
+                }
+            },
+            "@class": "com.apporchid.common.UIRequestParameters",
+            "isDebug": False,
         }
 
     @staticmethod
@@ -270,15 +292,15 @@ class MoAmWaterApiClient:
 
     async def async_get_hourly_usage(self) -> dict[str, list]:
         """Return today's hourly usage (gallons) — 'Actual Usage' series, 24 entries."""
-        data = await self._post(self._usage_payload(MICRO_APP_HOURLY, days="1"))
+        data = await self._post(self._usage_payload(MICRO_APP_HOURLY, days="1"), url=MICROAPP_URL)
         return self._extract_series(data)
 
     async def async_get_daily_usage(self, days: int = 30) -> dict[str, list]:
         """Return daily usage (gallons) for the last `days` days."""
-        data = await self._post(self._usage_payload(MICRO_APP_DAILY, days=str(days)))
+        data = await self._post(self._usage_payload(MICRO_APP_DAILY, days=str(days)), url=MICROAPP_URL)
         return self._extract_series(data)
 
     async def async_get_monthly_usage(self) -> dict[str, list]:
         """Return the last 12 months of usage (gallons)."""
-        data = await self._post(self._usage_payload(MICRO_APP_MONTHLY_12))
+        data = await self._post(self._usage_payload(MICRO_APP_MONTHLY_12, days="12"), url=MICROAPP_URL)
         return self._extract_series(data)
