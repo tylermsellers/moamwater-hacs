@@ -517,6 +517,8 @@ def _extract_authenticator_option(remediation_entry: dict[str, Any]) -> dict[str
         for sub in form_fields:
             if sub.get("name") == "id" and sub.get("value"):
                 authenticator_id = sub["value"]
+            elif sub.get("name") == "enrollmentId" and sub.get("value"):
+                enrollment_id = sub["value"]
             elif sub.get("name") == "methodType":
                 options = sub.get("options") or []
                 if options:
