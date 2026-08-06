@@ -516,15 +516,17 @@ def _extract_authenticator_option(remediation_entry: dict[str, Any]) -> dict[str
                 options = sub.get("options") or []
                 if options:
                     option = options[0]
-                    method_type = (option.get("value") or {}).get("value") if isinstance(
-                        option.get("value"), dict
-                    ) else option.get("value")
-                    nested_form = ((option.get("value") or {}).get("form") or {}).get("value") or []
-                    for nested in nested_form:
-                        if nested.get("name") == "enrollmentId" and nested.get("value"):
-                            enrollment_id = nested["value"]
-                        elif nested.get("name") == "methodType" and nested.get("value"):
-                            method_type = nested["value"]
+                    option_value = option.get("value")
+                    if isinstance(option_value, dict):
+                        method_type = option_value.get("value")
+                        nested_form = (option_value.get("form") or {}).get("value") or []
+                        for nested in nested_form:
+                            if nested.get("name") == "enrollmentId" and nested.get("value"):
+                                enrollment_id = nested["value"]
+                            elif nested.get("name") == "methodType" and nested.get("value"):
+                                method_type = nested["value"]
+                    else:
+                        method_type = option_value
 
         if authenticator_id:
             return {
