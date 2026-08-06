@@ -177,6 +177,11 @@ async def async_import_irrigation_statistics(
     async_add_external_statistics(hass, metadata, statistics)
 
 
+def parse_category_date(category: str):
+    """Public wrapper around `_parse_category_date` for use by sensor.py."""
+    return _parse_category_date(category)
+
+
 def _parse_category_date(category: str):
     """Parse a chart category label into a date, guessing the current year.
 

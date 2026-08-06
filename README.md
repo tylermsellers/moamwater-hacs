@@ -89,6 +89,7 @@ Copy `custom_components/moamwater/` into your Home Assistant `config/custom_comp
 | `sensor.today_s_water_usage` | Sum of today's hourly usage so far (gallons) |
 | `sensor.last_hour_water_usage` | Most recent hour's usage (gallons) |
 | `sensor.yesterday_s_water_usage` | Total usage for the last fully completed day (gallons) |
+| `sensor.billing_cycle_usage` | Cycle-to-date usage total (gallons) — only created if "Billing cycle start day" is set (see below) |
 
 Additionally, a `moamwater:usage` **external statistic** is populated with
 daily usage (gallons, cumulative sum) on every coordinator refresh — add it
@@ -143,6 +144,17 @@ sensor's own native statistics (e.g. in a `statistics-graph` Lovelace card)
 to break total water usage out into **Home** vs. **Irrigation** series. This
 option is entirely optional — leave it unset if you don't have a home-only
 usage sensor, and no irrigation estimate will be computed.
+
+## Options: billing-cycle-to-date usage sensor
+
+If your MyWater bill runs on a fixed day-of-month cycle (e.g. "30th to
+30th"), set **"Billing cycle start day"** in the same Configure dialog and
+a `sensor.billing_cycle_usage` entity is created, reporting the cycle-to-date
+usage total summed directly from the daily chart data on every refresh.
+Unlike a `utility_meter` or a manually-seeded accumulator, this needs no
+seeding and self-corrects automatically as long as the daily chart still
+covers back to the cycle's start day (typically true within a ~30-90 day
+lookback) — useful as an input to your own bill-estimate/ROI templates.
 
 ---
 
