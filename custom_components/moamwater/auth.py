@@ -147,6 +147,7 @@ import logging
 from http.cookies import SimpleCookie
 import re
 import secrets
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
@@ -571,8 +572,8 @@ class MoAmWaterAuthClient:
             f"Hop trace: {' -> '.join(hops)}"
         )
 
-    def _extract_mywater_tokens(self, resp: aiohttp.ClientResponse, current_url: str) -> dict[str, Any]:
-        """Extract MyWater auth cookies from response/jar in a case-insensitive way."""
+    def _extract_mywater_tokens(self, resp: aiohttp.ClientResponse, _current_url: str) -> dict[str, Any]:
+        """Extract MyWater auth cookies from THIS response in a case-insensitive way."""
         cookies: dict[str, str] = {}
         cookie_keys: set[str] = set()
 
@@ -592,12 +593,6 @@ class MoAmWaterAuthClient:
                 cookies[key.lower()] = morsel.value
                 cookie_keys.add(key)
 
-        # 3) Cookie jar view for this URL (defensive across redirects/domains).
-        jar_cookies = self._session.cookie_jar.filter_cookies(current_url)
-        for key, morsel in jar_cookies.items():
-            cookies[key.lower()] = morsel.value
-            cookie_keys.add(key)
-
         return {
             "access_token": cookies.get("mw-authenticationtoken"),
             "refresh_token": cookies.get("mw_refresh_token"),
@@ -610,10 +605,14 @@ class MoAmWaterAuthClient:
         for base in (MYWATER_BASE_URL, f"{MYWATER_BASE_URL}/", OKTA_BASE_URL, f"{OKTA_BASE_URL}/"):
             for key, morsel in self._session.cookie_jar.filter_cookies(base).items():
                 cookies[key.lower()] = morsel.value
-        return {
-            "access_token": cookies.get("mw-authenticationtoken"),
-            "refresh_token": cookies.get("mw_refresh_token"),
-        }
+        access_token = cookies.get("mw-authenticationtoken")
+        if access_token:
+            exp = decode_jwt_exp(access_token)
+            # Reject clearly stale jar tokens; if we can't decode exp, keep
+            # it as a last resort.
+            if exp is not None and exp <= time.time() + 60:
+                access_token = None
+        return {"access_token": access_token, "refresh_token": cookies.get("mw_refresh_token")}
 
 
 def async_refresh_access_token(*_args: Any, **_kwargs: Any) -> Any:
