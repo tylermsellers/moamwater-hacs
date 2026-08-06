@@ -324,6 +324,9 @@ class MoAmWaterAuthClient:
 
         remediation = ((response.get("remediation") or {}).get("value")) or []
         names = [r.get("name") for r in remediation]
+        _LOGGER.warning("IDX remediation step names: %s", names)
+        if not any(n in ("authenticator-verification-data", "challenge-authenticator") for n in names):
+            _LOGGER.warning("IDX full response (unrecognized remediation): %s", response)
 
         # Case 1: the next step just needs a passcode directly (e.g. TOTP,
         # or an SMS/voice factor that was already triggered) -- surface it
@@ -346,6 +349,7 @@ class MoAmWaterAuthClient:
         for rem in remediation:
             if rem.get("name") == "authenticator-verification-data":
                 authenticator = _extract_authenticator_option(rem)
+                _LOGGER.warning("IDX chosen authenticator to trigger: %s (raw remediation: %s)", authenticator, rem)
                 if authenticator:
                     self._authenticator = authenticator
                     triggered = await self._async_post_idx(
@@ -353,6 +357,7 @@ class MoAmWaterAuthClient:
                         {"authenticator": authenticator, "stateHandle": self._state_handle},
                         invalid_exc=MoAmWaterAuthError,
                     )
+                    _LOGGER.warning("IDX challenge-trigger response: %s", triggered)
                     self._factors = [authenticator]
                     self._state_handle = triggered.get("stateHandle", self._state_handle)
                     raise MfaRequired(self._factors)
