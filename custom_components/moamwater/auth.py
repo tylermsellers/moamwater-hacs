@@ -153,6 +153,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import aiohttp
 
 from .const import (
+    MYWATER_BASE_URL,
     OKTA_BASE_URL,
     OKTA_CLIENT_ID,
     OKTA_IDX_CHALLENGE_ANSWER_URL,
@@ -557,6 +558,14 @@ class MoAmWaterAuthClient:
                 break
             current_url = urljoin(current_url, location)
 
+        # Some deployments set MyWater cookies on an intermediate hop but
+        # don't expose them consistently via the per-response cookie parser.
+        # Final fallback: inspect the cookie jar directly for known base
+        # domains before failing the whole login.
+        jar_tokens = self._extract_tokens_from_cookie_jar()
+        if jar_tokens.get("access_token"):
+            return jar_tokens
+
         raise MoAmWaterAuthError(
             f"Redirect chain never yielded the mw-authenticationToken cookie. "
             f"Hop trace: {' -> '.join(hops)}"
@@ -593,6 +602,17 @@ class MoAmWaterAuthClient:
             "access_token": cookies.get("mw-authenticationtoken"),
             "refresh_token": cookies.get("mw_refresh_token"),
             "_cookie_keys": sorted(cookie_keys),
+        }
+
+    def _extract_tokens_from_cookie_jar(self) -> dict[str, Any]:
+        """Inspect cookie jar across relevant base URLs for MyWater tokens."""
+        cookies: dict[str, str] = {}
+        for base in (MYWATER_BASE_URL, f"{MYWATER_BASE_URL}/", OKTA_BASE_URL, f"{OKTA_BASE_URL}/"):
+            for key, morsel in self._session.cookie_jar.filter_cookies(base).items():
+                cookies[key.lower()] = morsel.value
+        return {
+            "access_token": cookies.get("mw-authenticationtoken"),
+            "refresh_token": cookies.get("mw_refresh_token"),
         }
 
 

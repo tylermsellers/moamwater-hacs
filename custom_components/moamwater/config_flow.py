@@ -132,7 +132,8 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         assert self._api is not None
         try:
             await self._api.async_discover_account()
-        except MoAmWaterApiError:
+        except MoAmWaterApiError as exc:
+            _LOGGER.error("MoAmWater account discovery failed: %s", exc)
             return self.async_show_form(
                 step_id="user", data_schema=STEP_USER_SCHEMA, errors={"base": "cannot_connect"}
             )
