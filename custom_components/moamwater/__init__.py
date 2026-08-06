@@ -37,6 +37,7 @@ from .const import (
     CONF_CONNECTION_CONTRACT_NUMBER,
     CONF_PASSWORD,
     CONF_PREMISE_ID,
+    CONF_REFRESH_TOKEN,
     CONF_STATE_CODE,
     CONF_USERNAME,
     DOMAIN,
@@ -67,6 +68,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
         session=session,
         username=entry.data[CONF_USERNAME],
         password=entry.data[CONF_PASSWORD],
+        refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
     )
     # Reuse identifiers discovered during config flow rather than re-fetching
     # the profile pipeline on every restart.
@@ -86,6 +88,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
         raise ConfigEntryAuthFailed(f"Invalid MyWater credentials: {exc}") from exc
     except MoAmWaterApiError as exc:
         raise ConfigEntryNotReady(f"Could not reach MyWater: {exc}") from exc
+
+    # Okta rotates the refresh_token on every redemption -- persist the new
+    # value immediately so the NEXT restart/renewal doesn't try to reuse a
+    # refresh_token Okta has already invalidated.
+    if client.refresh_token and client.refresh_token != entry.data.get(CONF_REFRESH_TOKEN):
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_REFRESH_TOKEN: client.refresh_token}
+        )
 
     coordinator = MoAmWaterCoordinator(hass, client, entry.entry_id)
     await coordinator.async_config_entry_first_refresh()

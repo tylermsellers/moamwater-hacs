@@ -1,65 +1,85 @@
 """Okta authentication client for Missouri American Water's MyWater portal.
 
-Login flow used by this client (classic Okta AuthN API + authorization_code,
-WITHOUT PKCE -- confirmed against a real captured browser trace):
+This is the REAL login flow, reverse-engineered from a HAR capture of an
+actual successful browser login (Firefox, through Okta's hosted Sign-In
+Widget). It supersedes every previous approach attempted in this codebase's
+history (see below) -- this one is Okta's genuine Identity Engine (IDX) API
+sequence, not a shortcut:
 
-    GET  {OKTA_BASE_URL}{issuer}/v1/authorize?client_id=...&response_type=code&
-         scope=...&redirect_uri=...&state=...                      -> the real
-      MyWater SPA hits this FIRST, before any credentials are submitted. It
-      returns status 200 with the Okta Sign-In Widget's HTML host page (not a
-      redirect), and -- critically -- establishes an Okta transaction/session
-      tied to this exact `state` value via response cookies. We must issue
-      this GET (and keep its cookies in our aiohttp session) before doing
-      anything else, or the later sessionToken redemption has no transaction
-      to attach to and Okta just re-serves the same HTML widget page again.
-    POST {OKTA_BASE_URL}/api/v1/authn                          -> primary auth
-      (username/password), reusing the cookie jar from the GET above. Returns
-      status "SUCCESS" with a `sessionToken`, or status "MFA_REQUIRED" with a
-      list of enrolled `factors` plus a `stateToken` used to drive the MFA
-      step.
-    POST {OKTA_BASE_URL}/api/v1/authn/factors/{id}/verify        -> submit the
-      passcode for the chosen factor; on success also returns a
-      `sessionToken`.
-    GET  {OKTA_BASE_URL}/login/token/redirect?stateToken=<sessionToken>  -> a
-         Firefox HAR capture of a REAL live login proved this is the actual
-      redemption endpoint (NOT `/v1/authorize?sessionToken=...`, which this
-      org's Identity Engine tenant does not support -- it just re-serves the
-      HTML widget with status 200, confirmed twice in prior live tests). This
-      endpoint immediately 302-redirects straight to our real `redirect_uri`
-      with `code` and `state` query params, e.g.
-      `Location: https://mywaterv2.amwater.com/openidlogin?code=...&state=...`.
-      Despite the query param being named `stateToken`, the value passed here
-      is the same `sessionToken` string returned by `/api/v1/authn` (classic
-      AuthN API terminology reuses "state"/"session" loosely) -- confirmed
-      against the HAR, whose request cookies included the same `JSESSIONID`
-      established earlier in the browser session (no separate /v1/authorize
-      GET was present in that capture at all).
-    POST {OKTA_BASE_URL}{issuer}/v1/token (grant_type=authorization_code, NO
-         code_verifier/PKCE -- the real browser's flow never used PKCE)
-      -> exchanges that `code` for the real `access_token` used as the
-      credential for `/api/mso/data`.
+    1. GET  {issuer}/v1/authorize?client_id=...&response_type=code&scope=...&
+             redirect_uri=...&state=...                        (no PKCE)
+       -> status 200, HTML host page for the Sign-In Widget. Embeds a
+          `stateToken` in a `var oktaData = {...}` JS object
+          (`oktaData.signIn.stateToken`).
+
+    2. POST {OKTA_BASE_URL}/idp/idx/introspect   {"stateToken": <from step 1>}
+       -> {"stateHandle": ...} plus a `remediation` array describing what
+          input is needed next (here: a password challenge).
+
+    3. (parallel, cosmetic but harmless to include) an invisible iframe loads
+       GET /auth/services/devicefingerprint, which runs Okta's fingerprint2
+       JS and POSTs the resulting hash to /api/v1/internal/device/nonce to
+       get a `{"nonce": ...}` back. The widget then sends
+       `X-Device-Fingerprint: <nonce>|<hash>|<extra>` on subsequent IDX
+       calls. We cannot run that JS from Python, so we skip computing a real
+       fingerprint hash and simply omit the header -- Okta's fingerprint
+       check appears to be a soft device-trust/risk signal (affecting
+       whether a *new* MFA challenge is required), not a hard block, since
+       the IDX endpoints did not reject our hop-traced attempts for lack of
+       this header in earlier testing of adjacent endpoints.
+
+    4. POST {OKTA_BASE_URL}/idp/idx/identify
+             {"identifier": <username>, "stateHandle": <from step 2>}
+       -> remediation now asks for a `challenge-authenticator` (password).
+
+    5. POST {OKTA_BASE_URL}/idp/idx/challenge/answer
+             {"credentials": {"passcode": <password>}, "stateHandle": ...}
+       -> if another factor (e.g. SMS) is enrolled, remediation now asks for
+          an `authenticator-verification-data` challenge (phone/SMS) instead
+          of returning `success` outright.
+
+    6. POST {OKTA_BASE_URL}/idp/idx/challenge
+             {"authenticator": {"id": ..., "enrollmentId": ..., "methodType": ...},
+              "stateHandle": ...}
+       -> triggers Okta to actually send the SMS/push, and returns a new
+          remediation asking for the passcode.
+
+    7. POST {OKTA_BASE_URL}/idp/idx/challenge/answer
+             {"credentials": {"passcode": <SMS code>}, "stateHandle": ...}
+       -> on success, response body includes
+          `"success": {"href": "https://.../login/token/redirect?stateToken=..."}`.
+
+    8. GET  that `success.href` URL -> 302 redirect straight to our real
+          `redirect_uri` with `code`/`state` query params.
+
+    9. POST {OKTA_BASE_URL}{issuer}/v1/token (grant_type=authorization_code,
+          NO PKCE) -> exchanges `code` for the real `access_token` (and a
+          `refresh_token`, since `offline_access` is in our requested scopes)
+          used as the credential for `/api/mso/data`.
 
 IMPORTANT history of failed approaches (do not repeat these mistakes):
-  - An earlier version attempted Okta's newer Identity Engine "Interaction
-    Code" flow (`POST /v1/interact`), but this Okta app registration only has
-    `authorization_code`, `password`, and `refresh_token` grants enabled --
-    `/v1/interact` reliably fails with `unauthorized_client: The client is
-    not authorized to use the provided grant type`.
-  - A later version added PKCE and generated a brand-new `/v1/authorize` URL
-    (new `state`, new code_challenge) only AFTER obtaining the sessionToken,
-    without ever having done an initial unauthenticated GET first. This
-    always returned status 200 with the interactive HTML widget instead of a
-    302, because there was no prior transaction for the sessionToken to
-    redeem against.
-  - A subsequent version tried pre-opening an unauthenticated `/v1/authorize`
-    GET first (to open a transaction/cookies), then re-hitting that exact
-    same URL with `&sessionToken=...` appended. This STILL returned status
-    200 with the widget HTML even though the session cookies (JSESSIONID,
-    sid, xids) were present -- proving `/v1/authorize?sessionToken=...` is
-    simply not a supported redemption mechanism for this Identity Engine
-    org, no matter how the transaction/cookies are set up. The correct
-    mechanism (`/login/token/redirect?stateToken=...`) was only discovered
-    from a HAR capture of a real successful login.
+  - Interaction Code / `/v1/interact` flow: this Okta app registration's
+    allowed grant types are only `authorization_code`, `password`,
+    `refresh_token` -- `/v1/interact` reliably fails with
+    `unauthorized_client: The client is not authorized to use the provided
+    grant type`.
+  - Classic AuthN API (`POST /api/v1/authn` -> sessionToken) + redeeming
+    that sessionToken via `/v1/authorize?sessionToken=...` (with or without
+    PKCE, with or without first opening an unauthenticated `/v1/authorize`
+    transaction, with or without `/login/sessionCookieRedirect`): ALL of
+    these variants returned status 200 with the interactive HTML widget
+    instead of a redirect, because this org's Identity Engine tenant does
+    not support that classic-Okta shortcut at all -- it isn't a cookie or
+    parameter problem, the mechanism itself doesn't exist here.
+  - Once the correct redemption endpoint (`/login/token/redirect?stateToken=`)
+    was found (from a smaller HAR capture) and used with a `sessionToken`
+    obtained via the classic AuthN API, Okta's WAF returned a bare 403
+    Access Forbidden -- even after adding realistic browser headers
+    (User-Agent, Referer, Sec-Fetch-*). This is because the classic AuthN
+    API was never actually part of this org's real flow at all: real
+    logins never call `/api/v1/authn`, they go through `/idp/idx/*`. The
+    403 was Okta's WAF rejecting a session that skipped the real IDX
+    handshake steps entirely, not a header-fidelity problem.
 
 Also important: the captured `Authorization: bearer ...` header used by
 MyWater's `/api/mso/data` calls decodes as an Okta **access token** (JWT
@@ -70,31 +90,35 @@ exchange rather than scraping cookies.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
+import secrets
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import aiohttp
 
 from .const import (
-    OKTA_AUTHN_FACTORS_VERIFY_URL,
-    OKTA_AUTHN_URL,
     OKTA_BASE_URL,
     OKTA_CLIENT_ID,
+    OKTA_IDX_CHALLENGE_ANSWER_URL,
+    OKTA_IDX_CHALLENGE_URL,
+    OKTA_IDX_IDENTIFY_URL,
+    OKTA_IDX_INTROSPECT_URL,
     OKTA_ISSUER_PATH,
     OKTA_REDIRECT_URI,
-    MYWATER_BASE_URL,
+    OKTA_SCOPES,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+AUTHORIZE_URL = f"{OKTA_BASE_URL}{OKTA_ISSUER_PATH}/v1/authorize"
 TOKEN_URL = f"{OKTA_BASE_URL}{OKTA_ISSUER_PATH}/v1/token"
 
-# Okta's WAF/bot-detection returns a bare 403 for requests that don't look
-# like a real browser (missing User-Agent/Referer/Sec-Fetch-* etc). A real
-# Firefox login was captured returning a clean 302 with these headers
-# present, so we send a realistic browser header set on every request in
-# this flow rather than aiohttp's default (near-empty) headers.
+# Okta's WAF/bot-detection appears to expect a real browser's header set on
+# every request (confirmed by a bare 403 when these were absent in earlier
+# testing). Mirrors the real captured Firefox request headers exactly.
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) "
@@ -105,19 +129,26 @@ _BROWSER_HEADERS = {
 _BROWSER_NAV_HEADERS = {
     **_BROWSER_HEADERS,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": f"{MYWATER_BASE_URL}/",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "same-origin",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
 }
-
-_JSON_HEADERS = {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
+# Header set used for /idp/idx/* and device/nonce XHR calls -- mirrors the
+# okta-signin-widget's own fetch()/jQuery.post() headers exactly.
+_IDX_HEADERS = {
     **_BROWSER_HEADERS,
+    "Accept": "application/json; okta-version=1.0.0",
+    "Content-Type": "application/json",
+    "X-Okta-User-Agent-Extended": "okta-auth-js/7.14.5 okta-signin-widget-7.47.2 okta-hosted",
+    "Origin": OKTA_BASE_URL,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
+
+_STATE_TOKEN_RE = re.compile(r"var oktaData\s*=\s*(\{.*?\});", re.DOTALL)
 
 
 class MoAmWaterAuthError(Exception):
@@ -148,110 +179,200 @@ class MfaRequired(Exception):
 
 
 class MoAmWaterAuthClient:
-    """Handles the multi-step Okta AuthN login and authorization_code exchange."""
+    """Drives the real Okta Identity Engine (IDX) login sequence used by the
+    hosted Sign-In Widget, as reverse-engineered from a HAR capture.
+    """
 
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
-        self._state_token: str | None = None
+        self._state_handle: str | None = None
+        self._authenticator: dict[str, Any] | None = None
         self._factors: list[dict[str, Any]] = []
 
     async def async_start_login(self, username: str, password: str) -> dict[str, Any]:
-        """Begin login via the classic Okta AuthN API (/api/v1/authn).
+        """Begin login via the real IDX sequence: authorize -> introspect -> identify -> answer.
 
-        Returns the token dict on immediate success (no MFA configured), or
-        raises MfaRequired if a factor challenge must be completed via
-        async_submit_mfa().
+        Returns the token dict on immediate success (no further MFA
+        configured), or raises MfaRequired if a factor challenge must be
+        completed via async_submit_mfa().
         """
         _LOGGER.debug("Starting MyWater login for user %s", username)
 
-        async with self._session.post(
-            OKTA_AUTHN_URL,
-            json={"username": username, "password": password, "options": {"warnBeforePasswordExpired": False}},
-            headers=_JSON_HEADERS,
-        ) as resp:
-            data = await resp.json(content_type=None)
-            status = data.get("status")
-
-            if resp.status >= 400 or status == "LOCKED_OUT":
-                if resp.status == 401 or _is_credential_error(data):
-                    raise InvalidCredentials(_error_summary(data))
-                raise MoAmWaterAuthError(
-                    f"Okta primary auth failed (status {resp.status}): {_error_summary(data)}"
-                )
-
-        if status == "SUCCESS":
-            session_token = data.get("sessionToken")
-            if not session_token:
-                raise MoAmWaterAuthError(f"Okta auth reported SUCCESS but no sessionToken: {data}")
-            return await self._async_finish_with_session_token(session_token)
-
-        if status == "MFA_REQUIRED" or status == "MFA_ENROLL":
-            self._state_token = data.get("stateToken")
-            self._factors = (data.get("_embedded") or {}).get("factors", [])
-            if not self._factors:
-                raise MoAmWaterAuthError(f"MFA required but no factors listed: {data}")
-            _LOGGER.debug("MFA required; %d factor(s) available", len(self._factors))
-            raise MfaRequired(self._factors)
-
-        raise MoAmWaterAuthError(f"Unexpected Okta primary-auth status '{status}': {data}")
+        state_token = await self._async_get_initial_state_token()
+        self._state_handle = await self._async_introspect(state_token)
+        response = await self._async_identify(username)
+        response = await self._async_answer_password(password, response)
+        return await self._async_handle_remediation(response)
 
     async def async_submit_mfa(self, passcode: str) -> dict[str, Any]:
         """Submit the MFA passcode (SMS/email/TOTP code) to complete login."""
-        if not self._state_token or not self._factors:
+        if not self._state_handle or not self._authenticator:
             raise MoAmWaterAuthError("No active login session; call async_start_login first")
 
-        factor_id = self._factors[0].get("id")
-        if not factor_id:
-            raise MoAmWaterAuthError(f"Could not determine factor id from: {self._factors}")
+        response = await self._async_post_idx(
+            OKTA_IDX_CHALLENGE_ANSWER_URL,
+            {"credentials": {"passcode": passcode}, "stateHandle": self._state_handle},
+            invalid_exc=InvalidMfaCode,
+        )
+        return await self._async_handle_remediation(response)
 
-        verify_url = OKTA_AUTHN_FACTORS_VERIFY_URL.format(factor_id=factor_id)
-        async with self._session.post(
-            verify_url,
-            json={"stateToken": self._state_token, "passCode": passcode},
-            headers=_JSON_HEADERS,
-        ) as resp:
-            data = await resp.json(content_type=None)
-            status = data.get("status")
+    async def _async_get_initial_state_token(self) -> str:
+        """GET {issuer}/v1/authorize and extract the embedded `stateToken`.
 
-            if resp.status >= 400 or status not in ("SUCCESS", "MFA_CHALLENGE"):
-                raise InvalidMfaCode(
-                    f"MFA verification failed (status {resp.status}): {_error_summary(data)}"
-                )
-            if status == "MFA_CHALLENGE" and (data.get("factorResult") == "WAITING"):
-                # Push-notification-style factor not yet approved; surface as
-                # an invalid/incomplete code so the UI lets the user retry.
-                raise InvalidMfaCode("MFA challenge still pending (factor not yet approved)")
-
-        session_token = data.get("sessionToken")
-        if not session_token:
-            raise MoAmWaterAuthError(f"MFA verify reported success but no sessionToken: {data}")
-
-        return await self._async_finish_with_session_token(session_token)
-
-    def _build_token_redirect_url(self, session_token: str) -> str:
-        """Build the `/login/token/redirect?stateToken=...` redemption URL.
-
-        Confirmed via a HAR capture of a real successful login: despite the
-        param being named `stateToken`, the value is the `sessionToken`
-        string returned by `/api/v1/authn` (or its MFA-verify equivalent).
-        This single GET 302-redirects straight to our real `redirect_uri`
-        with `code`/`state` query params -- no prior `/v1/authorize` call
-        or PKCE is involved at all.
+        No PKCE/sessionToken params are sent -- this matches the real
+        browser's very first request exactly.
         """
-        return f"{OKTA_BASE_URL}/login/token/redirect?{urlencode({'stateToken': session_token})}"
+        authorize_params = {
+            "client_id": OKTA_CLIENT_ID,
+            "response_type": "code",
+            "scope": OKTA_SCOPES,
+            "redirect_uri": OKTA_REDIRECT_URI,
+            "state": secrets.token_urlsafe(16),
+        }
+        url = f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
+        async with self._session.get(url, headers=_BROWSER_NAV_HEADERS) as resp:
+            body_text = await resp.text()
+            if resp.status != 200:
+                raise MoAmWaterAuthError(
+                    f"Initial /v1/authorize GET failed (status {resp.status}): {body_text[:500]}"
+                )
 
-    async def _async_finish_with_session_token(self, session_token: str) -> dict[str, Any]:
-        """Redeem an Okta `sessionToken` via `/login/token/redirect`, then get tokens."""
-        redeem_url = self._build_token_redirect_url(session_token)
+        match = _STATE_TOKEN_RE.search(body_text)
+        if not match:
+            raise MoAmWaterAuthError(
+                "Could not find embedded oktaData/stateToken in /v1/authorize response"
+            )
+        try:
+            okta_data = json.loads(_unescape_js_hex(match.group(1)))
+        except json.JSONDecodeError as exc:
+            raise MoAmWaterAuthError(f"Could not parse embedded oktaData JSON: {exc}") from exc
 
-        code_value = await self._walk_redirects_for_code(redeem_url)
+        state_token = (okta_data.get("signIn") or {}).get("stateToken")
+        if not state_token:
+            raise MoAmWaterAuthError(f"oktaData.signIn.stateToken missing: {okta_data}")
+        return state_token
+
+    async def _async_introspect(self, state_token: str) -> str:
+        """POST /idp/idx/introspect {stateToken} -> stateHandle."""
+        async with self._session.post(
+            OKTA_IDX_INTROSPECT_URL,
+            json={"stateToken": state_token},
+            headers=_IDX_HEADERS,
+        ) as resp:
+            body_text = await resp.text()
+            if resp.status != 200:
+                raise MoAmWaterAuthError(
+                    f"/idp/idx/introspect failed (status {resp.status}): {body_text[:500]}"
+                )
+            data = json.loads(body_text)
+
+        state_handle = data.get("stateHandle")
+        if not state_handle:
+            raise MoAmWaterAuthError(f"/idp/idx/introspect response missing stateHandle: {data}")
+        return state_handle
+
+    async def _async_identify(self, username: str) -> dict[str, Any]:
+        """POST /idp/idx/identify {identifier, stateHandle} -> next remediation."""
+        return await self._async_post_idx(
+            OKTA_IDX_IDENTIFY_URL,
+            {"identifier": username, "stateHandle": self._state_handle},
+            invalid_exc=InvalidCredentials,
+        )
+
+    async def _async_answer_password(
+        self, password: str, response: dict[str, Any]
+    ) -> dict[str, Any]:
+        """POST /idp/idx/challenge/answer {credentials.passcode=password}."""
+        # Refresh stateHandle from the latest response (Okta rotates it on
+        # each step in the real capture).
+        self._state_handle = response.get("stateHandle", self._state_handle)
+        return await self._async_post_idx(
+            OKTA_IDX_CHALLENGE_ANSWER_URL,
+            {"credentials": {"passcode": password}, "stateHandle": self._state_handle},
+            invalid_exc=InvalidCredentials,
+        )
+
+    async def _async_post_idx(
+        self, url: str, payload: dict[str, Any], invalid_exc: type[MoAmWaterAuthError]
+    ) -> dict[str, Any]:
+        """Shared POST helper for all /idp/idx/* calls with consistent error handling."""
+        async with self._session.post(url, json=payload, headers=_IDX_HEADERS) as resp:
+            body_text = await resp.text()
+            try:
+                data = json.loads(body_text) if body_text else {}
+            except json.JSONDecodeError:
+                data = {}
+
+            if resp.status >= 400:
+                messages = _idx_error_summary(data)
+                if resp.status in (400, 401, 403):
+                    raise invalid_exc(messages or f"status {resp.status}: {body_text[:500]}")
+                raise MoAmWaterAuthError(
+                    f"{url} failed (status {resp.status}): {messages or body_text[:500]}"
+                )
+        return data
+
+    async def _async_handle_remediation(self, response: dict[str, Any]) -> dict[str, Any]:
+        """Inspect an IDX response and either finish login, trigger the next
+        factor challenge automatically (e.g. requesting an SMS code be
+        sent), or raise MfaRequired for the caller to supply a passcode.
+        """
+        self._state_handle = response.get("stateHandle", self._state_handle)
+
+        success = response.get("success")
+        if success and success.get("href"):
+            return await self._async_finish_from_success_href(success["href"])
+
+        remediation = ((response.get("remediation") or {}).get("value")) or []
+        names = [r.get("name") for r in remediation]
+
+        # Case 1: the next step just needs a passcode directly (e.g. TOTP,
+        # or an SMS/voice factor that was already triggered) -- surface it
+        # as MfaRequired so the config flow can prompt for a code.
+        for rem in remediation:
+            if rem.get("name") == "challenge-authenticator":
+                fields = ((rem.get("value") or []))
+                needs_passcode_only = any(
+                    f.get("name") == "credentials" for f in fields
+                ) and not any(f.get("name") == "authenticator" for f in fields)
+                if needs_passcode_only:
+                    self._factors = [{"id": "current"}]
+                    raise MfaRequired(self._factors)
+
+        # Case 2: the next step is choosing/triggering a factor (e.g. "send
+        # me an SMS code") -- the real widget auto-selects the enrolled
+        # phone factor and POSTs /idp/idx/challenge to trigger it, THEN asks
+        # for the passcode. Auto-trigger the first available factor so the
+        # user only ever has to type one code.
+        for rem in remediation:
+            if rem.get("name") == "authenticator-verification-data":
+                authenticator = _extract_authenticator_option(rem)
+                if authenticator:
+                    self._authenticator = authenticator
+                    triggered = await self._async_post_idx(
+                        OKTA_IDX_CHALLENGE_URL,
+                        {"authenticator": authenticator, "stateHandle": self._state_handle},
+                        invalid_exc=MoAmWaterAuthError,
+                    )
+                    self._factors = [authenticator]
+                    self._state_handle = triggered.get("stateHandle", self._state_handle)
+                    raise MfaRequired(self._factors)
+
+        raise MoAmWaterAuthError(
+            f"Unexpected IDX remediation; don't know how to proceed: {names or response}"
+        )
+
+    async def _async_finish_from_success_href(self, href: str) -> dict[str, Any]:
+        """Follow the `success.href` (the real `/login/token/redirect?stateToken=...`
+        URL returned by Okta) to get our authorization `code`, then exchange it.
+        """
+        code_value = await self._walk_redirects_for_code(href)
         if not code_value:
             raise MoAmWaterAuthError(
                 "Authorization redirect did not yield a 'code' query parameter"
             )
-
         tokens = await self._exchange_code_for_tokens(code_value)
-        return {"access_token": tokens["access_token"]}
+        return {"access_token": tokens["access_token"], "refresh_token": tokens.get("refresh_token")}
 
     async def _walk_redirects_for_code(self, url: str) -> str | None:
         """Manually follow a redirect chain, extracting the `code` query param.
@@ -327,25 +448,99 @@ class MoAmWaterAuthClient:
         return data
 
 
-def _error_summary(data: dict[str, Any]) -> str:
-    """Extract a human-readable error message from an Okta AuthN error response."""
-    if isinstance(data, dict):
-        if data.get("errorSummary"):
-            return data["errorSummary"]
-        causes = data.get("errorCauses") or []
-        if causes:
-            return "; ".join(c.get("errorSummary", "") for c in causes if c.get("errorSummary"))
-    return str(data)[:500]
+async def async_refresh_access_token(
+    session: aiohttp.ClientSession, refresh_token: str
+) -> dict[str, Any]:
+    """Redeem a stored Okta `refresh_token` for a fresh `access_token`.
 
-
-def _is_credential_error(data: dict[str, Any]) -> bool:
-    """True if the AuthN error indicates bad username/password specifically.
-
-    Okta's classic AuthN API returns `errorCode: "E0000004"` for
-    "Authentication failed" (bad credentials), as opposed to other
-    errorCodes (locked out, policy violation, rate limiting, etc.) which
-    should NOT be shown to the user as "wrong password".
+    Used on every restart/renewal after the initial interactive login, via
+    `grant_type=refresh_token` -- an allowed grant for this Okta client.
+    Okta typically rotates the refresh_token on each redemption -- callers
+    MUST persist the new `refresh_token` value from the returned dict.
     """
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OKTA_CLIENT_ID,
+        "scope": OKTA_SCOPES,
+    }
+    async with session.post(
+        TOKEN_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded", **_BROWSER_HEADERS},
+    ) as resp:
+        body_text = await resp.text()
+        if resp.status != 200:
+            raise MoAmWaterAuthError(
+                f"Okta refresh_token exchange failed (status {resp.status}): {body_text[:500]}"
+            )
+        data = await resp.json(content_type=None)
+
+    if "access_token" not in data:
+        raise MoAmWaterAuthError(f"Refresh response missing access_token: {data}")
+    return data
+
+
+def _unescape_js_hex(js_literal: str) -> str:
+    r"""Unescape JS `\xNN` hex-escape sequences into their literal characters.
+
+    The embedded `oktaData` object is emitted as a JS string literal with
+    e.g. `\x3A` for `:`, which is not valid JSON as-is.
+    """
+    return re.sub(r"\\x([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), js_literal)
+
+
+def _extract_authenticator_option(remediation_entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Pull {"id", "enrollmentId", "methodType"} for the first authenticator
+    option out of an `authenticator-verification-data` remediation entry.
+
+    Okta's IDX schema nests the enrollmentId/methodType pair for each
+    selectable method inside `methodType.options[i].value.form.value[]`.
+    This walks that structure defensively and falls back to "sms" (the only
+    method type observed in the reference HAR capture) if the nested value
+    can't be resolved, since `id` alone is enough to identify *which*
+    authenticator (e.g. "Phone") -- only enrollmentId/methodType select
+    *how* to challenge it.
+    """
+    for field in remediation_entry.get("value") or []:
+        if field.get("name") != "authenticator":
+            continue
+        form_fields = (field.get("form") or {}).get("value") or []
+
+        authenticator_id = None
+        enrollment_id = None
+        method_type = None
+        for sub in form_fields:
+            if sub.get("name") == "id" and sub.get("value"):
+                authenticator_id = sub["value"]
+            elif sub.get("name") == "methodType":
+                options = sub.get("options") or []
+                if options:
+                    option = options[0]
+                    method_type = (option.get("value") or {}).get("value") if isinstance(
+                        option.get("value"), dict
+                    ) else option.get("value")
+                    nested_form = ((option.get("value") or {}).get("form") or {}).get("value") or []
+                    for nested in nested_form:
+                        if nested.get("name") == "enrollmentId" and nested.get("value"):
+                            enrollment_id = nested["value"]
+                        elif nested.get("name") == "methodType" and nested.get("value"):
+                            method_type = nested["value"]
+
+        if authenticator_id:
+            return {
+                "id": authenticator_id,
+                "enrollmentId": enrollment_id,
+                "methodType": method_type or "sms",
+            }
+    return None
+
+
+def _idx_error_summary(data: dict[str, Any]) -> str:
+    """Extract a human-readable error message from an IDX error response."""
     if not isinstance(data, dict):
-        return False
-    return data.get("errorCode") == "E0000004"
+        return str(data)[:500]
+    messages = (data.get("messages") or {}).get("value") or []
+    if messages:
+        return "; ".join(m.get("message", "") for m in messages if m.get("message"))
+    return str(data)[:500]

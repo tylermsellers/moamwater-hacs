@@ -26,6 +26,7 @@ from .const import (
     CONF_CONNECTION_CONTRACT_NUMBER,
     CONF_PASSWORD,
     CONF_PREMISE_ID,
+    CONF_REFRESH_TOKEN,
     CONF_STATE_CODE,
     CONF_USERNAME,
     DOMAIN,
@@ -139,6 +140,7 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
             data={
                 CONF_USERNAME: self._username,
                 CONF_PASSWORD: self._password,
+                CONF_REFRESH_TOKEN: self._api.refresh_token,
                 CONF_BUSINESS_PARTNER_NUMBER: self._api.business_partner_number,
                 CONF_CONNECTION_CONTRACT_NUMBER: self._api.connection_contract_number,
                 CONF_PREMISE_ID: self._api.premise_id,

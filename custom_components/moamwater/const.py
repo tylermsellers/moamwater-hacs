@@ -9,13 +9,20 @@ OKTA_CLIENT_ID = "0oa29ovb79AWEoS8V5d7"  # captured from bearer token 'cid' clai
 
 # This Okta app registration's allowed grant types are `authorization_code`,
 # `password`, and `refresh_token` (confirmed via the `unauthorized_client`
-# error returned by /v1/interact -- the Interaction Code/OIE grant is NOT
-# enabled for this client). So login uses the classic Okta AuthN API
-# (`/api/v1/authn`) to establish a session, then the standard
-# `/v1/authorize` + `/v1/token` (grant_type=authorization_code) PKCE dance
-# to mint an access token, instead of the newer IDX/interaction-code flow.
-OKTA_AUTHN_URL = f"{OKTA_BASE_URL}/api/v1/authn"
-OKTA_AUTHN_FACTORS_VERIFY_URL = f"{OKTA_BASE_URL}/api/v1/authn/factors/{{factor_id}}/verify"
+# error returned by /v1/interact -- the pure Interaction Code/OIE grant is
+# NOT enabled for this client). However, this org IS an Identity Engine (OIE)
+# tenant whose hosted Sign-In Widget drives login via the IDX API
+# (`/idp/idx/*`) using a `stateToken`/`stateHandle` obtained by first loading
+# `/v1/authorize` -- confirmed via a HAR capture of a real successful login.
+# This is different from both the classic AuthN API (`/api/v1/authn`, which
+# this org's widget does NOT use) and the raw Interaction Code flow
+# (`/v1/interact`, blocked by the grant-type restriction above).
+OKTA_IDX_INTROSPECT_URL = f"{OKTA_BASE_URL}/idp/idx/introspect"
+OKTA_IDX_IDENTIFY_URL = f"{OKTA_BASE_URL}/idp/idx/identify"
+OKTA_IDX_CHALLENGE_URL = f"{OKTA_BASE_URL}/idp/idx/challenge"
+OKTA_IDX_CHALLENGE_ANSWER_URL = f"{OKTA_BASE_URL}/idp/idx/challenge/answer"
+OKTA_DEVICE_NONCE_URL = f"{OKTA_BASE_URL}/api/v1/internal/device/nonce"
+OKTA_TOKEN_REDIRECT_URL = f"{OKTA_BASE_URL}/login/token/redirect"
 
 MYWATER_BASE_URL = "https://mywaterv2.amwater.com"
 MYWATER_LOGIN_REDIRECT_PATH = "/openidlogin"
@@ -46,6 +53,7 @@ CONF_BUSINESS_PARTNER_NUMBER = "business_partner_number"
 CONF_CONNECTION_CONTRACT_NUMBER = "connection_contract_number"
 CONF_PREMISE_ID = "premise_id"
 CONF_STATE_CODE = "state_code"
+CONF_REFRESH_TOKEN = "refresh_token"
 
 # --- Storage keys for tokens ---
 DATA_ACCESS_TOKEN = "access_token"

@@ -12,7 +12,7 @@ from typing import Any
 
 import aiohttp
 
-from .auth import MoAmWaterAuthClient, MfaRequired
+from .auth import MoAmWaterAuthClient, MfaRequired, async_refresh_access_token
 from .const import (
     APPLICATION_ID,
     MICRO_APP_DAILY,
@@ -41,12 +41,14 @@ class MoAmWaterApiClient:
         session: aiohttp.ClientSession,
         username: str,
         password: str,
+        refresh_token: str | None = None,
     ) -> None:
         self._session = session
         self._username = username
         self._password = password
         self._auth = MoAmWaterAuthClient(session)
         self._access_token: str | None = None
+        self.refresh_token: str | None = refresh_token
 
         self.business_partner_number: str | None = None
         self.connection_contract_number: str | None = None
@@ -54,14 +56,29 @@ class MoAmWaterApiClient:
         self.state_code: str = "MO"
 
     async def async_login(self) -> None:
-        """Perform the full Okta IDX login. Raises MfaRequired if a code is needed."""
+        """Log in, preferring a stored `refresh_token` over interactive login.
+
+        A stored refresh_token (obtained once via a real browser login) is
+        the ONLY reliable path -- see auth.py's module docstring for why
+        automating the interactive Okta Sign-In Widget login from scratch
+        does not work (WAF blocks). Falls back to the interactive IDX flow
+        (which may raise MfaRequired) only if no refresh_token is stored yet.
+        """
+        if self.refresh_token:
+            result = await async_refresh_access_token(self._session, self.refresh_token)
+            self._access_token = result["access_token"]
+            self.refresh_token = result.get("refresh_token", self.refresh_token)
+            return
+
         result = await self._auth.async_start_login(self._username, self._password)
         self._access_token = result["access_token"]
+        self.refresh_token = result.get("refresh_token") or self.refresh_token
 
     async def async_submit_mfa(self, passcode: str) -> None:
         """Complete login after an MFA challenge was raised by async_login()."""
         result = await self._auth.async_submit_mfa(passcode)
         self._access_token = result["access_token"]
+        self.refresh_token = result.get("refresh_token") or self.refresh_token
 
     def _headers(self) -> dict[str, str]:
         if not self._access_token:
@@ -76,7 +93,17 @@ class MoAmWaterApiClient:
         try:
             async with self._session.post(DATA_URL, json=payload, headers=self._headers()) as resp:
                 if resp.status == 401:
-                    raise MoAmWaterApiError("Session expired; re-authentication required")
+                    # Access tokens are short-lived; re-derive a fresh one
+                    # from our stored refresh_token and retry once before
+                    # giving up (avoids forcing reauth every polling cycle).
+                    if not self.refresh_token:
+                        raise MoAmWaterApiError("Session expired; re-authentication required")
+                    await self.async_login()
+                    async with self._session.post(
+                        DATA_URL, json=payload, headers=self._headers()
+                    ) as retry_resp:
+                        retry_resp.raise_for_status()
+                        return await retry_resp.json(content_type=None)
                 resp.raise_for_status()
                 return await resp.json(content_type=None)
         except aiohttp.ClientError as exc:
