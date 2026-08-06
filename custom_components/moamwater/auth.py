@@ -144,10 +144,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from http.cookies import SimpleCookie
 import re
 import secrets
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import aiohttp
 
@@ -449,9 +450,9 @@ class MoAmWaterAuthClient:
 
         remediation = ((response.get("remediation") or {}).get("value")) or []
         names = [r.get("name") for r in remediation]
-        _LOGGER.warning("IDX remediation step names: %s", names)
+        _LOGGER.debug("IDX remediation step names: %s", names)
         if not any(n in ("authenticator-verification-data", "challenge-authenticator") for n in names):
-            _LOGGER.warning("IDX full response (unrecognized remediation): %s", response)
+            _LOGGER.debug("IDX full response (unrecognized remediation): %s", response)
 
         # Case 1: the next step just needs a passcode directly (e.g. TOTP,
         # or an SMS/voice factor that was already triggered) -- surface it
@@ -474,7 +475,11 @@ class MoAmWaterAuthClient:
         for rem in remediation:
             if rem.get("name") == "authenticator-verification-data":
                 authenticator = _extract_authenticator_option(rem)
-                _LOGGER.warning("IDX chosen authenticator to trigger: %s (raw remediation: %s)", authenticator, rem)
+                _LOGGER.debug(
+                    "IDX chosen authenticator to trigger: %s (raw remediation: %s)",
+                    authenticator,
+                    rem,
+                )
                 if authenticator:
                     self._authenticator = authenticator
                     triggered = await self._async_post_idx(
@@ -482,7 +487,7 @@ class MoAmWaterAuthClient:
                         {"authenticator": authenticator, "stateHandle": self._state_handle},
                         invalid_exc=MoAmWaterAuthError,
                     )
-                    _LOGGER.warning("IDX challenge-trigger response: %s", triggered)
+                    _LOGGER.debug("IDX challenge-trigger response: %s", triggered)
                     self._factors = [authenticator]
                     self._state_handle = triggered.get("stateHandle", self._state_handle)
                     raise MfaRequired(self._factors)
@@ -518,18 +523,18 @@ class MoAmWaterAuthClient:
                 current_url, allow_redirects=False, headers=_BROWSER_NAV_HEADERS
             ) as resp:
                 location = resp.headers.get("Location")
-                cookies = {c.key: c.value for c in resp.cookies.values()} if resp.cookies else {}
                 body_text = await resp.text()
+                tokens = self._extract_mywater_tokens(resp, current_url)
                 hops.append(
                     f"{resp.status} {current_url.split('?')[0]} "
-                    f"(set-cookie: {list(cookies) or 'none'}, "
+                    f"(set-cookie: {tokens.get('_cookie_keys') or 'none'}, "
                     f"location: {(location or 'none').split('?')[0]})"
                 )
 
-                if "mw-authenticationToken" in cookies:
+                if tokens.get("access_token"):
                     return {
-                        "access_token": cookies["mw-authenticationToken"],
-                        "refresh_token": cookies.get("mw_refresh_token"),
+                        "access_token": tokens["access_token"],
+                        "refresh_token": tokens.get("refresh_token"),
                     }
 
                 if resp.status not in (301, 302, 303, 307, 308) and not location:
@@ -550,12 +555,45 @@ class MoAmWaterAuthClient:
 
             if not location:
                 break
-            current_url = location
+            current_url = urljoin(current_url, location)
 
         raise MoAmWaterAuthError(
             f"Redirect chain never yielded the mw-authenticationToken cookie. "
             f"Hop trace: {' -> '.join(hops)}"
         )
+
+    def _extract_mywater_tokens(self, resp: aiohttp.ClientResponse, current_url: str) -> dict[str, Any]:
+        """Extract MyWater auth cookies from response/jar in a case-insensitive way."""
+        cookies: dict[str, str] = {}
+        cookie_keys: set[str] = set()
+
+        # 1) Parsed response cookies.
+        for morsel in resp.cookies.values():
+            cookies[morsel.key.lower()] = morsel.value
+            cookie_keys.add(morsel.key)
+
+        # 2) Raw Set-Cookie headers (defensive for parser edge-cases).
+        for raw in resp.headers.getall("Set-Cookie", []):
+            parsed = SimpleCookie()
+            try:
+                parsed.load(raw)
+            except Exception:
+                continue
+            for key, morsel in parsed.items():
+                cookies[key.lower()] = morsel.value
+                cookie_keys.add(key)
+
+        # 3) Cookie jar view for this URL (defensive across redirects/domains).
+        jar_cookies = self._session.cookie_jar.filter_cookies(current_url)
+        for key, morsel in jar_cookies.items():
+            cookies[key.lower()] = morsel.value
+            cookie_keys.add(key)
+
+        return {
+            "access_token": cookies.get("mw-authenticationtoken"),
+            "refresh_token": cookies.get("mw_refresh_token"),
+            "_cookie_keys": sorted(cookie_keys),
+        }
 
 
 def async_refresh_access_token(*_args: Any, **_kwargs: Any) -> Any:
