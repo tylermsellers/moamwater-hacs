@@ -148,7 +148,7 @@ _IDX_HEADERS = {
     "Sec-Fetch-Site": "same-origin",
 }
 
-_STATE_TOKEN_RE = re.compile(r"var oktaData\s*=\s*(\{.*?\});", re.DOTALL)
+_STATE_TOKEN_RE = re.compile(r'"stateToken"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
 class MoAmWaterAuthError(Exception):
@@ -242,14 +242,13 @@ class MoAmWaterAuthClient:
             raise MoAmWaterAuthError(
                 "Could not find embedded oktaData/stateToken in /v1/authorize response"
             )
-        try:
-            okta_data = json.loads(_unescape_js_hex(match.group(1)))
-        except json.JSONDecodeError as exc:
-            raise MoAmWaterAuthError(f"Could not parse embedded oktaData JSON: {exc}") from exc
-
-        state_token = (okta_data.get("signIn") or {}).get("stateToken")
+        # The oktaData object embeds a raw JS function literal (the consent
+        # "cancel" callback), so it is NOT valid JSON and can't be parsed as
+        # a whole -- pull the stateToken value out directly via regex
+        # instead, unescaping its \xNN/\uNNNN JS string escapes.
+        state_token = _unescape_js_hex(match.group(1))
         if not state_token:
-            raise MoAmWaterAuthError(f"oktaData.signIn.stateToken missing: {okta_data}")
+            raise MoAmWaterAuthError("oktaData stateToken was empty")
         return state_token
 
     async def _async_introspect(self, state_token: str) -> str:
