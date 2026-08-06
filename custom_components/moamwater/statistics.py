@@ -87,10 +87,12 @@ def _parse_category_date(category: str):
     """Parse a chart category label into a date, guessing the current year.
 
     MyWater's daily chart labels have been observed as short month/day strings
-    (e.g. "Jul 21") without a year, since the chart only spans ~30-90 days.
+    without a year, since the chart only spans ~30-90 days -- both hyphenated
+    (e.g. "Jul-21", confirmed from the live portal's 30-day chart) and
+    space-separated (e.g. "Jul 21") forms have been seen.
     """
     now = dt_util.now()
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%b %d", "%m/%d"):
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%b-%d", "%b %d", "%m/%d"):
         try:
             parsed = datetime.strptime(category, fmt)
         except ValueError:
