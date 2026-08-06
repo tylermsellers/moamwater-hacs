@@ -98,6 +98,54 @@ native water meter integration.
 
 ---
 
+## Known data quirks: AMI meter lag
+
+Missouri American Water's AMI meter reads are **not real-time** and are
+polled by the utility's backend on an irregular cadence (not strictly once
+per calendar day), with the portal's own disclaimer stating usage "may be
+delayed up to 72 hours." In practice this means:
+
+- `sensor.today_s_water_usage` and `sensor.last_hour_water_usage` can show
+  data that is actually 1-3 days old, mislabeled as "today"/"this hour" —
+  this is **not a bug in this integration**, it reflects exactly what the
+  MyWater portal itself shows for the same period. Don't use these two
+  sensors for real-time leak detection; use a dedicated flow-based device
+  (e.g. Flo/Moen, StreamLabs) for that instead.
+- Once a day's read does land, that **day's total is accurate** — MyWater's
+  daily-chart values line up with real per-day usage (e.g. a day with heavy
+  irrigation shows a correctly large total), it's only the *display
+  timing/labeling* that lags, not the eventual per-day accuracy. This is why
+  `moamwater:usage`'s daily statistics are trustworthy for billing/ROI
+  tracking even though the "today" sensor is not trustworthy for real-time
+  monitoring.
+- `sensor.yesterday_s_water_usage` is generally the most reliable of the
+  three real-time sensors since "yesterday" has had more time to catch up.
+
+## Options: irrigation-only usage estimate
+
+If you have a **home-only** water usage sensor from another integration
+(e.g. a Flo/Moen leak-detection valve's daily usage sensor, which excludes
+outdoor/irrigation lines on a typical install), you can tell this
+integration about it and it will derive a per-day **irrigation-only**
+estimate automatically:
+
+1. Settings → Devices & Services → **MyWater** → **Configure**
+2. Select your home-only usage sensor in **"Home usage entity"**
+3. Submit — the entry reloads and starts computing:
+   `irrigation_estimate(day) = max(0, moamwater_daily_total(day) - home_daily_total(day))`,
+   clamped at 0 since MyWater's whole-property total should always be >= a
+   home-only sensor's total (small negative gaps are just meter-read
+   rounding/timing, not real irrigation).
+
+This is published as a second external statistic, `moamwater:irrigation_estimate`
+(gallons, cumulative sum), so it can be charted alongside your home-only
+sensor's own native statistics (e.g. in a `statistics-graph` Lovelace card)
+to break total water usage out into **Home** vs. **Irrigation** series. This
+option is entirely optional — leave it unset if you don't have a home-only
+usage sensor, and no irrigation estimate will be computed.
+
+---
+
 ## Repository layout
 
 ```
@@ -107,7 +155,7 @@ moamwater-hacs/
       __init__.py        # Entry setup, login, statistics push
       api.py              # /api/mso/data client (usage + account discovery)
       auth.py              # Okta IDX login flow (identify/challenge/answer + PKCE)
-      config_flow.py       # Two-step config flow (credentials, then MFA)
+      config_flow.py       # Config flow (credentials + MFA, reauth) and options flow
       const.py             # Endpoint URLs, microApplicationId map, config keys
       coordinator.py       # DataUpdateCoordinator polling hourly/daily usage
       manifest.json
