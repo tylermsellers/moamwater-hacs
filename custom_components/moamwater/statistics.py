@@ -14,12 +14,13 @@ from homeassistant.components.recorder.models import StatisticData, StatisticMet
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    statistics_during_period,
 )
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .const import STATISTIC_ID
+from .const import STATISTIC_ID, STATISTIC_ID_IRRIGATION
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +79,99 @@ async def async_import_daily_statistics(hass: HomeAssistant, daily_usage: dict) 
         name="MyWater Usage",
         source=_DOMAIN_PREFIX,
         statistic_id=STATISTIC_ID,
+        unit_of_measurement=UnitOfVolume.GALLONS,
+    )
+    async_add_external_statistics(hass, metadata, statistics)
+
+
+async def async_import_irrigation_statistics(
+    hass: HomeAssistant, daily_usage: dict, home_entity_id: str
+) -> None:
+    """Derive an "irrigation-only" external statistic per day.
+
+    MyWater's daily total covers the whole property (irrigation included);
+    `home_entity_id` is a home-only usage sensor (e.g. a Flo/Moen leak
+    detector's "today's usage" sensor, which resets to 0 daily so its
+    per-day recorder `state` already equals that day's home-only total).
+    Irrigation for a given day is estimated as
+    ``max(0, mywater_day_total - home_day_total)``, clamped at 0 since small
+    negative gaps are just meter-read timing/rounding, not real irrigation.
+    """
+    categories = daily_usage.get("categories", [])
+    values = daily_usage.get("series", {}).get("Actual Usage", [])
+    if not categories or not values:
+        return
+
+    parsed_days: list[tuple[datetime, float]] = []
+    for category, value in zip(categories, values):
+        if value is None:
+            continue
+        try:
+            day = _parse_category_date(category)
+        except ValueError:
+            continue
+        parsed_days.append((day, value))
+
+    if not parsed_days:
+        return
+
+    parsed_days.sort(key=lambda item: item[0])
+    range_start = dt_util.as_utc(
+        datetime(parsed_days[0][0].year, parsed_days[0][0].month, parsed_days[0][0].day)
+    )
+    range_end = dt_util.as_utc(
+        datetime(parsed_days[-1][0].year, parsed_days[-1][0].month, parsed_days[-1][0].day)
+    ) + timedelta(days=1)
+
+    home_stats = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        range_start,
+        range_end,
+        {home_entity_id},
+        "day",
+        None,
+        {"state"},
+    )
+    home_by_date: dict[tuple[int, int, int], float] = {}
+    for row in home_stats.get(home_entity_id, []):
+        row_start = row["start"]
+        row_dt = (
+            dt_util.as_local(dt_util.utc_from_timestamp(row_start))
+            if isinstance(row_start, (int, float))
+            else dt_util.as_local(row_start)
+        )
+        home_by_date[(row_dt.year, row_dt.month, row_dt.day)] = row.get("state") or 0.0
+
+    last_stats = await hass.async_add_executor_job(
+        get_last_statistics, hass, 1, STATISTIC_ID_IRRIGATION, True, {"sum"}
+    )
+    running_sum = 0.0
+    last_stats_time: datetime | None = None
+    if last_stats and STATISTIC_ID_IRRIGATION in last_stats:
+        last_entry = last_stats[STATISTIC_ID_IRRIGATION][0]
+        running_sum = last_entry.get("sum") or 0.0
+        last_stats_time = dt_util.utc_from_timestamp(last_entry["start"])
+
+    statistics: list[StatisticData] = []
+    for day, total_value in parsed_days:
+        start = dt_util.as_utc(datetime(day.year, day.month, day.day))
+        if last_stats_time is not None and start <= last_stats_time:
+            continue
+        home_value = home_by_date.get((day.year, day.month, day.day), 0.0)
+        irrigation_value = max(0.0, total_value - home_value)
+        running_sum += irrigation_value
+        statistics.append(StatisticData(start=start, state=irrigation_value, sum=running_sum))
+
+    if not statistics:
+        return
+
+    metadata = StatisticMetaData(
+        has_mean=False,
+        has_sum=True,
+        name="MyWater Irrigation Estimate",
+        source=_DOMAIN_PREFIX,
+        statistic_id=STATISTIC_ID_IRRIGATION,
         unit_of_measurement=UnitOfVolume.GALLONS,
     )
     async_add_external_statistics(hass, metadata, statistics)

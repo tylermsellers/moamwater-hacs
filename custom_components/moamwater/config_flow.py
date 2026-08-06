@@ -19,7 +19,8 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import MoAmWaterApiClient, MoAmWaterApiError
@@ -29,6 +30,7 @@ from .const import (
     CONF_ACCESS_TOKEN_EXPIRES_AT,
     CONF_BUSINESS_PARTNER_NUMBER,
     CONF_CONNECTION_CONTRACT_NUMBER,
+    CONF_HOME_USAGE_ENTITY_ID,
     CONF_PASSWORD,
     CONF_PREMISE_ID,
     CONF_REFRESH_TOKEN,
@@ -62,6 +64,10 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         self._username: str | None = None
         self._password: str | None = None
         self._api: MoAmWaterApiClient | None = None
+
+    @staticmethod
+    def async_get_options_flow(config_entry: ConfigEntry) -> "MoAmWaterOptionsFlow":
+        return MoAmWaterOptionsFlow()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -155,3 +161,28 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_STATE_CODE: self._api.state_code,
             },
         )
+
+
+class MoAmWaterOptionsFlow(OptionsFlow):
+    """Optional settings: a home-only usage entity used to derive an
+    irrigation-only estimate (MyWater's whole-property total minus that
+    entity's daily usage). Leave unset to skip the irrigation estimate.
+    """
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.options.get(CONF_HOME_USAGE_ENTITY_ID)
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_HOME_USAGE_ENTITY_ID, description={"suggested_value": current}
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(domain="sensor", device_class="water")
+                ),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

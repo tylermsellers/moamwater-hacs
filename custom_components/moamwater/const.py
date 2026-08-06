@@ -76,3 +76,12 @@ COOKIE_JAR_FILENAME_TEMPLATE = "moamwater_{entry_id}_cookies.pickle"
 DEFAULT_SCAN_INTERVAL_MINUTES = 60
 
 STATISTIC_ID = "moamwater:usage"
+
+# Optional entry option: a home-only water usage sensor (e.g. a Flo/Moen
+# leak-detector's daily usage sensor) used to derive an "irrigation-only"
+# estimate (MyWater's whole-property daily total minus that day's home-only
+# usage, clamped to >=0). Not required -- if unset, no irrigation estimate
+# is imported.
+CONF_HOME_USAGE_ENTITY_ID = "home_usage_entity_id"
+
+STATISTIC_ID_IRRIGATION = "moamwater:irrigation_estimate"

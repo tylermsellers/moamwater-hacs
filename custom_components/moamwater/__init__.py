@@ -36,6 +36,7 @@ from .const import (
     CONF_ACCESS_TOKEN_EXPIRES_AT,
     CONF_BUSINESS_PARTNER_NUMBER,
     CONF_CONNECTION_CONTRACT_NUMBER,
+    CONF_HOME_USAGE_ENTITY_ID,
     CONF_PASSWORD,
     CONF_PREMISE_ID,
     CONF_REFRESH_TOKEN,
@@ -44,7 +45,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import MoAmWaterCoordinator
-from .statistics import async_import_daily_statistics
+from .statistics import async_import_daily_statistics, async_import_irrigation_statistics
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -101,6 +102,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
         try:
             daily = await client.async_get_daily_usage(days=90)
             await async_import_daily_statistics(hass, daily)
+            home_entity_id = entry.options.get(CONF_HOME_USAGE_ENTITY_ID)
+            if home_entity_id:
+                await async_import_irrigation_statistics(hass, daily, home_entity_id)
         except MoAmWaterApiError as exc:
             _LOGGER.warning("Could not import MyWater statistics: %s", exc)
 
