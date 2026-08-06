@@ -241,8 +241,8 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
 
 class MoAmWaterOptionsFlow(OptionsFlow):
     """Optional settings: a home-only usage entity used to derive an
-    irrigation-only estimate (MyWater's whole-property total minus that
-    entity's daily usage). Leave unset to skip the irrigation estimate.
+    outside-the-home (e.g. irrigation) estimate (MyWater's whole-property
+    total minus that entity's daily usage). Leave unset to skip the estimate.
     """
 
     async def async_step_init(

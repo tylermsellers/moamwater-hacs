@@ -6,7 +6,13 @@
 Home Assistant integration for **Missouri American Water**'s MyWater customer
 portal (`mywaterv2.amwater.com`), pulling hourly and daily water usage
 (gallons) into Home Assistant — including long-term statistics compatible
-with the **Energy dashboard**'s water source.
+with the **Energy dashboard**'s water source. Because MyWater's meter sits
+at the property line, this gives you **whole-property usage tracking**
+(house, irrigation, outbuildings, everything on that meter). If you also
+have a home-only device like a Flo/Moen valve, this integration can combine
+the two to distinguish **home usage** from everything else outside the main
+line (see [Options](#options-home-vs-outside-the-home-usage-breakdown)
+below).
 
 > **Unofficial project.** This is a reverse-engineered integration built by
 > inspecting MyWater's own web app network traffic. It is **not affiliated
@@ -121,13 +127,20 @@ delayed up to 72 hours." In practice this means:
 - `sensor.yesterday_s_water_usage` is generally the most reliable of the
   three real-time sensors since "yesterday" has had more time to catch up.
 
-## Options: irrigation-only usage estimate
+## Options: home vs. outside-the-home usage breakdown
 
-If you have a **home-only** water usage sensor from another integration
-(e.g. a Flo/Moen leak-detection valve's daily usage sensor, which excludes
-outdoor/irrigation lines on a typical install), you can tell this
-integration about it and it will derive a per-day **irrigation-only**
-estimate automatically:
+MyWater's meter sits at the property line, so `moamwater:usage` reflects
+**total property usage** — everything drawn through that meter, whether it's
+the house itself, an irrigation system, a pool fill line, a detached shop,
+outdoor spigots, etc. Irrigation is just one common example of usage that
+happens outside the main line into the home; this feature works the same
+way regardless of what's actually on the "outside" side of your plumbing.
+
+If you separately have a **home-only** water usage sensor from another
+integration (e.g. a Flo/Moen leak-detection valve installed on the main line
+into the house, which typically excludes outdoor branches like irrigation),
+you can tell this integration about it and it will derive a per-day
+**outside-the-home** estimate automatically:
 
 1. Settings → Devices & Services → **MyWater** → **Configure**
 2. Select your home-only usage sensor in **"Home usage entity"**
@@ -135,14 +148,17 @@ estimate automatically:
    `irrigation_estimate(day) = max(0, moamwater_daily_total(day) - home_daily_total(day))`,
    clamped at 0 since MyWater's whole-property total should always be >= a
    home-only sensor's total (small negative gaps are just meter-read
-   rounding/timing, not real irrigation).
+   rounding/timing, not real outside-the-home usage).
 
 This is published as a second external statistic, `moamwater:irrigation_estimate`
 (gallons, cumulative sum), so it can be charted alongside your home-only
 sensor's own native statistics (e.g. in a `statistics-graph` Lovelace card)
-to break total water usage out into **Home** vs. **Irrigation** series. This
-option is entirely optional — leave it unset if you don't have a home-only
-usage sensor, and no irrigation estimate will be computed.
+to break total property usage out into **Home** vs. **Everything else**
+(irrigation, outbuildings, pools, etc.) series. This option is entirely
+optional — leave it unset if you don't have a home-only usage sensor, and no
+breakout estimate will be computed. MyWater's whole-property total
+(`moamwater:usage`) is always populated regardless of whether this option is
+configured.
 
 ## Options: billing-cycle-to-date usage in your own config
 
