@@ -151,7 +151,12 @@ class MoAmWaterApiClient:
             async with self._session.post(DATA_URL, json=payload, headers=self._headers()) as resp:
                 if resp.status == 401:
                     raise _Unauthorized()
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    body = await resp.text()
+                    raise MoAmWaterApiError(
+                        f"MyWater API HTTP {resp.status} for {payload.get('microApplicationId')}: "
+                        f"{body[:500] or '(empty body)'}"
+                    )
                 return await resp.json(content_type=None)
         except aiohttp.ClientError as exc:
             raise MoAmWaterApiError(f"Request to MyWater failed: {exc}") from exc

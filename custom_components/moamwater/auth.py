@@ -152,6 +152,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import aiohttp
+from yarl import URL
 
 from .const import (
     MYWATER_BASE_URL,
@@ -526,6 +527,7 @@ class MoAmWaterAuthClient:
             ) as resp:
                 location = resp.headers.get("Location")
                 body_text = await resp.text()
+                self._sync_cookie_jar_from_response(resp, current_url)
                 tokens = self._extract_mywater_tokens(resp, current_url)
                 hops.append(
                     f"{resp.status} {current_url.split('?')[0]} "
@@ -613,6 +615,30 @@ class MoAmWaterAuthClient:
             if exp is not None and exp <= time.time() + 60:
                 access_token = None
         return {"access_token": access_token, "refresh_token": cookies.get("mw_refresh_token")}
+
+    def _sync_cookie_jar_from_response(self, resp: aiohttp.ClientResponse, current_url: str) -> None:
+        """Force cookie-jar updates from response cookies and raw Set-Cookie.
+
+        Some response/cookie combinations in this flow don't always populate
+        the shared cookie jar consistently in every environment. This keeps
+        MyWater session cookies (JSESSIONID/SESSION/ATMOSPHEREID/etc.) in
+        sync before the next `/api/mso/data` call.
+        """
+        response_url = URL(current_url)
+        if resp.cookies:
+            self._session.cookie_jar.update_cookies(
+                {m.key: m.value for m in resp.cookies.values()}, response_url=response_url
+            )
+        for raw in resp.headers.getall("Set-Cookie", []):
+            parsed = SimpleCookie()
+            try:
+                parsed.load(raw)
+            except Exception:
+                continue
+            if parsed:
+                self._session.cookie_jar.update_cookies(
+                    {k: m.value for k, m in parsed.items()}, response_url=response_url
+                )
 
 
 def async_refresh_access_token(*_args: Any, **_kwargs: Any) -> Any:
