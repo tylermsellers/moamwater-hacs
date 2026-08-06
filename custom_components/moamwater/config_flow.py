@@ -41,7 +41,6 @@ from .auth import InvalidCredentials, InvalidMfaCode, MfaRequired, MoAmWaterAuth
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_ACCESS_TOKEN_EXPIRES_AT,
-    CONF_BILLING_CYCLE_START_DAY,
     CONF_BUSINESS_PARTNER_NUMBER,
     CONF_CONNECTION_CONTRACT_NUMBER,
     CONF_HOME_USAGE_ENTITY_ID,
@@ -241,13 +240,9 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class MoAmWaterOptionsFlow(OptionsFlow):
-    """Optional settings:
-    - a home-only usage entity used to derive an irrigation-only estimate
-      (MyWater's whole-property total minus that entity's daily usage).
-    - a billing-cycle start day used to compute an always-current,
-      self-correcting cycle-to-date usage total straight from the daily
-      chart data (replacing the need for a manual accumulator/automation).
-    Leave either unset to skip that feature.
+    """Optional settings: a home-only usage entity used to derive an
+    irrigation-only estimate (MyWater's whole-property total minus that
+    entity's daily usage). Leave unset to skip the irrigation estimate.
     """
 
     async def async_step_init(
@@ -256,21 +251,13 @@ class MoAmWaterOptionsFlow(OptionsFlow):
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current_home_entity = self.config_entry.options.get(CONF_HOME_USAGE_ENTITY_ID)
-        current_cycle_day = self.config_entry.options.get(CONF_BILLING_CYCLE_START_DAY)
+        current = self.config_entry.options.get(CONF_HOME_USAGE_ENTITY_ID)
         schema = vol.Schema(
             {
                 vol.Optional(
-                    CONF_HOME_USAGE_ENTITY_ID,
-                    description={"suggested_value": current_home_entity},
+                    CONF_HOME_USAGE_ENTITY_ID, description={"suggested_value": current}
                 ): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor", device_class="water")
-                ),
-                vol.Optional(
-                    CONF_BILLING_CYCLE_START_DAY,
-                    description={"suggested_value": current_cycle_day},
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(min=1, max=28, step=1, mode="box")
                 ),
             }
         )

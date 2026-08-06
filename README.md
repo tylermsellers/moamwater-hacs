@@ -88,8 +88,7 @@ Copy `custom_components/moamwater/` into your Home Assistant `config/custom_comp
 |---|---|
 | `sensor.today_s_water_usage` | Sum of today's hourly usage so far (gallons) |
 | `sensor.last_hour_water_usage` | Most recent hour's usage (gallons) |
-| `sensor.yesterday_s_water_usage` | Total usage for the last fully completed day (gallons) |
-| `sensor.billing_cycle_usage` | Cycle-to-date usage total (gallons) — only created if "Billing cycle start day" is set (see below) |
+| `sensor.yesterday_s_water_usage` | Total usage for the last fully completed day (gallons); also exposes a generic `daily_history` attribute (see below) |
 
 Additionally, a `moamwater:usage` **external statistic** is populated with
 daily usage (gallons, cumulative sum) on every coordinator refresh — add it
@@ -145,16 +144,40 @@ to break total water usage out into **Home** vs. **Irrigation** series. This
 option is entirely optional — leave it unset if you don't have a home-only
 usage sensor, and no irrigation estimate will be computed.
 
-## Options: billing-cycle-to-date usage sensor
+## Options: billing-cycle-to-date usage in your own config
 
-If your MyWater bill runs on a fixed day-of-month cycle (e.g. "30th to
-30th"), set **"Billing cycle start day"** in the same Configure dialog and
-a `sensor.billing_cycle_usage` entity is created, reporting the cycle-to-date
-usage total summed directly from the daily chart data on every refresh.
-Unlike a `utility_meter` or a manually-seeded accumulator, this needs no
-seeding and self-corrects automatically as long as the daily chart still
-covers back to the cycle's start day (typically true within a ~30-90 day
-lookback) — useful as an input to your own bill-estimate/ROI templates.
+This integration deliberately makes **no assumptions about your billing
+cycle** (residential billing cycles vary by customer/account). Instead,
+`sensor.yesterday_s_water_usage` exposes a generic `daily_history` attribute:
+a list of `{"date": "YYYY-MM-DD", "gallons": <float>}` entries (oldest
+first, typically 30-90 days of coverage). Sum whichever days you need in
+your own `configuration.yaml` template, e.g. for a "30th-to-30th" cycle:
+
+```yaml
+template:
+  - sensor:
+      - name: "Water Cycle Confirmed Gallons"
+        unit_of_measurement: "gal"
+        state: >
+          {% set cycle_day = 30 %}
+          {% set today = now() %}
+          {% if today.day >= cycle_day %}
+            {% set cycle_start = today.replace(day=cycle_day, hour=0, minute=0, second=0, microsecond=0) %}
+          {% else %}
+            {% set first_of_month = today.replace(day=1) %}
+            {% set prev_month_last = first_of_month - timedelta(days=1) %}
+            {% set prev_cycle_day = [cycle_day, prev_month_last.day] | min %}
+            {% set cycle_start = prev_month_last.replace(day=prev_cycle_day, hour=0, minute=0, second=0, microsecond=0) %}
+          {% endif %}
+          {% set history = state_attr('sensor.yesterday_s_water_usage', 'daily_history') or [] %}
+          {{ history | selectattr('date', 'ge', cycle_start.strftime('%Y-%m-%d')) | map(attribute='gallons') | sum | round(1) }}
+```
+
+This keeps all cycle-specific logic in your own config, not in the shared
+integration -- combine it with another home-only usage sensor's own
+`utility_meter` cycle total (e.g. `max(confirmed, home_only_live)`) to build
+a hybrid "live estimate now, replaced by confirmed data once it catches up"
+tracker, same pattern used for the irrigation estimate above.
 
 ---
 

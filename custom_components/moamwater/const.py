@@ -85,12 +85,3 @@ STATISTIC_ID = "moamwater:usage"
 CONF_HOME_USAGE_ENTITY_ID = "home_usage_entity_id"
 
 STATISTIC_ID_IRRIGATION = "moamwater:irrigation_estimate"
-
-# Optional entry option: day-of-month your MyWater billing cycle starts
-# (e.g. 30 for a "30th-to-30th" cycle). When set, a "Billing Cycle Usage"
-# sensor sums the daily chart's values since the most recent occurrence of
-# this day, giving an always-current, self-correcting cycle-to-date total
-# computed directly from the same (now-fixed) daily data used for the
-# moamwater:usage external statistic -- no separate accumulator/automation
-# or manual seeding required.
-CONF_BILLING_CYCLE_START_DAY = "billing_cycle_start_day"
