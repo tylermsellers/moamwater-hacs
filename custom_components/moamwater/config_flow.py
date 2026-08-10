@@ -37,7 +37,14 @@ from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import MoAmWaterApiClient, MoAmWaterApiError
-from .auth import InvalidCredentials, InvalidMfaCode, MfaRequired, MoAmWaterAuthError
+from .auth import (
+    InvalidCredentials,
+    InvalidMfaCode,
+    MfaRequired,
+    MoAmWaterAuthError,
+    async_create_session_with_saved_cookies,
+    async_save_session_cookies,
+)
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_ACCESS_TOKEN_EXPIRES_AT,
@@ -77,6 +84,7 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         self._username: str | None = None
         self._password: str | None = None
         self._api: MoAmWaterApiClient | None = None
+        self._session: Any = None  # aiohttp.ClientSession, only set/persisted during reauth
 
     @staticmethod
     def async_get_options_flow(config_entry: ConfigEntry) -> "MoAmWaterOptionsFlow":
@@ -162,8 +170,14 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._username = user_input[CONF_USERNAME]
             self._password = user_input[CONF_PASSWORD]
-            session = async_get_clientsession(self.hass)
-            self._api = MoAmWaterApiClient(session, self._username, self._password)
+            # Reuse the same disk-persisted cookie jar __init__.py uses for
+            # this entry, and save it back after a successful login below --
+            # otherwise a reauth's fresh Okta session would only live in
+            # this flow's ephemeral session and be gone again by the next
+            # HA restart, needing yet another OTP.
+            entry_id = self._get_reauth_entry().entry_id
+            self._session = await async_create_session_with_saved_cookies(self.hass, entry_id)
+            self._api = MoAmWaterApiClient(self._session, self._username, self._password)
 
             try:
                 await self._api.async_login()
@@ -231,6 +245,16 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if self.source == SOURCE_REAUTH:
             self._abort_if_unique_id_mismatch()
+            if self._session is not None:
+                # Persist the just-authenticated Okta session cookies before
+                # the entry reloads (which spins up a brand-new session in
+                # __init__.py that reads this same file) -- this is what
+                # lets a LATER restart silently replay this session instead
+                # of needing another OTP.
+                await async_save_session_cookies(
+                    self.hass, self._session, self._get_reauth_entry().entry_id
+                )
+                await self._session.close()
             return self.async_update_reload_and_abort(
                 self._get_reauth_entry(), data=data
             )

@@ -4,12 +4,22 @@ Architecture
 ------------
 One config entry covers one MyWater account (username + password, with the
 account/premise identifiers discovered during setup). On setup, the entry:
-  1. Creates a shared ``MoAmWaterApiClient`` over Home Assistant's managed
-     HTTP session (connector/SSL/proxy behavior consistent with HA core).
-  2. Calls ``client.async_login()``, which first attempts to reuse a still-
-     valid stored access token (persisted in the config entry). This avoids
-     interactive reauth across typical HA restarts while token lifetime
-     remains valid.
+  1. Creates a dedicated ``MoAmWaterApiClient`` over its own aiohttp
+     ``ClientSession`` (NOT HA's shared session -- see
+     ``auth.async_create_session_with_saved_cookies``: HA's shared session
+     isn't meant for cookie-based auth flows and its cookie jar doesn't
+     survive a real restart anyway). Okta's session cookies are loaded from
+     disk here and saved back on unload/shutdown, so a silent SSO replay can
+     work across genuine HA reboots, not just entry reloads.
+  2. Calls ``client.async_login(allow_interactive=False)``, which first
+     attempts to reuse a still-valid stored access token (persisted in the
+     config entry), then a silent Okta SSO replay. This avoids interactive
+     reauth across typical HA restarts while token lifetime remains valid.
+     ``allow_interactive=False`` means it will never fall through to a full
+     password+SMS login here -- that would text the user an OTP with no one
+     around to enter it. If both silent paths fail, it raises straight to
+     reauth (``ConfigEntryAuthFailed``); the OTP is only sent once the user
+     actively submits the reauth form in ``config_flow.py``.
   3. Creates one ``MoAmWaterCoordinator`` that polls hourly/daily usage.
   4. Pushes daily usage into Home Assistant's long-term statistics via
      ``statistics.py`` so it can be added to the Energy dashboard exactly
@@ -23,14 +33,21 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import aiohttp
+
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant
+
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import MoAmWaterApiClient, MoAmWaterApiError
-from .auth import MfaRequired, MoAmWaterAuthError
+from .auth import (
+    MfaRequired,
+    MoAmWaterAuthError,
+    async_create_session_with_saved_cookies,
+    async_save_session_cookies,
+)
 from .const import (
     CONF_ACCESS_TOKEN,
     CONF_ACCESS_TOKEN_EXPIRES_AT,
@@ -58,6 +75,7 @@ class MoAmWaterRuntimeData:
 
     client: MoAmWaterApiClient
     coordinator: MoAmWaterCoordinator
+    session: aiohttp.ClientSession
 
 
 type MoAmWaterConfigEntry = ConfigEntry[MoAmWaterRuntimeData]
@@ -65,7 +83,10 @@ type MoAmWaterConfigEntry = ConfigEntry[MoAmWaterRuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) -> bool:
     """Set up MyWater for this account config entry."""
-    session = async_get_clientsession(hass)
+    # A dedicated session (not HA's shared one) with a real, disk-persisted
+    # cookie jar -- see async_create_session_with_saved_cookies's docstring
+    # for why this matters for minimizing OTPs across real HA restarts.
+    session = await async_create_session_with_saved_cookies(hass, entry.entry_id)
     client = MoAmWaterApiClient(
         session=session,
         username=entry.data[CONF_USERNAME],
@@ -82,13 +103,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
     client.state_code = entry.data.get(CONF_STATE_CODE, "MO")
 
     try:
-        await client.async_login()
+        # allow_interactive=False: never start a full password+SMS login
+        # here. This runs unattended on every HA startup (and reload), so
+        # falling through to a real interactive login would text the user
+        # an OTP with nobody there yet to enter it. If the stored token has
+        # expired and Okta's own session cookies are no longer valid either,
+        # just raise (via MfaRequired) straight to reauth -- the OTP will
+        # only be sent once the user actively submits the reauth form.
+        await client.async_login(allow_interactive=False)
     except MfaRequired as exc:
         # Stored-token/silent-login fallback failed; ask HA to trigger reauth.
+        await session.close()
         raise ConfigEntryAuthFailed("MyWater requires a new MFA challenge") from exc
     except MoAmWaterAuthError as exc:
+        await session.close()
         raise ConfigEntryAuthFailed(f"Invalid MyWater credentials: {exc}") from exc
     except MoAmWaterApiError as exc:
+        await session.close()
         raise ConfigEntryNotReady(f"Could not reach MyWater: {exc}") from exc
 
     _async_persist_tokens_if_changed(hass, entry, client)
@@ -96,7 +127,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
     coordinator = MoAmWaterCoordinator(hass, client, entry.entry_id)
     await coordinator.async_config_entry_first_refresh()
 
-    entry.runtime_data = MoAmWaterRuntimeData(client=client, coordinator=coordinator)
+    entry.runtime_data = MoAmWaterRuntimeData(client=client, coordinator=coordinator, session=session)
 
     async def _async_push_statistics() -> None:
         try:
@@ -113,6 +144,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
     )
     # Push once immediately so the Energy dashboard has data right away.
     await _async_push_statistics()
+
+    async def _async_save_cookies_on_stop(_event) -> None:
+        # HA doesn't always call async_unload_entry on every restart path
+        # (e.g. an abrupt stop), so also save on the stop event directly as
+        # a belt-and-suspenders measure -- this is the persistence that lets
+        # a silent SSO replay work on the NEXT boot instead of needing a new
+        # OTP.
+        await async_save_session_cookies(hass, session, entry.entry_id)
+
+    entry.async_on_unload(
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_save_cookies_on_stop)
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -146,6 +189,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) -
         # Persist current tokens so the next restart can skip reauth when
         # they are still valid.
         _async_persist_tokens_if_changed(hass, entry, runtime.client)
+        # Persist Okta's session cookies too, so a silent SSO replay can
+        # still work on the next restart even once the access token itself
+        # has expired (see async_create_session_with_saved_cookies).
+        await async_save_session_cookies(hass, runtime.session, entry.entry_id)
+        await runtime.session.close()
     return unload_ok
 
 

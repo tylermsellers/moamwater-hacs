@@ -80,7 +80,7 @@ class MoAmWaterApiClient:
         self.refresh_token = result.get("refresh_token") or self.refresh_token
         self._access_token_expires_at = decode_jwt_exp(self._access_token)
 
-    async def async_login(self) -> None:
+    async def async_login(self, *, allow_interactive: bool = True) -> None:
         """Log in, avoiding a full interactive (password + SMS) login whenever possible.
 
         Three-tier strategy, in order of preference:
@@ -95,8 +95,19 @@ class MoAmWaterApiClient:
              us mint a new access_token with zero user interaction even
              after the access_token itself has expired.
           3. Only if both of those fail (Okta's own session has *also*
-             expired) do we fall back to a full interactive login, which
-             raises MfaRequired so the caller can prompt for a new SMS code.
+             expired) do we fall back to a full interactive login -- but
+             ONLY when `allow_interactive=True`. Starting that flow submits
+             the password and, when a phone/SMS factor is enrolled, makes
+             Okta send a real OTP text immediately (see auth.py's
+             `_async_handle_remediation` Case 2), before anyone has had a
+             chance to type anything in. `async_setup_entry`/the coordinator
+             call this with `allow_interactive=False` so a plain HA restart
+             or background poll never fires off an unsolicited OTP; they
+             just raise MfaRequired (surfaced as ConfigEntryAuthFailed) so
+             HA starts the reauth flow. The OTP is only ever sent once the
+             user actively submits the reauth form (config_flow.py), which
+             calls this with the default `allow_interactive=True` since the
+             user is right there ready to enter the code next.
         """
         if self._access_token and self._access_token_expires_at:
             # 5 minute safety margin so we don't start a poll cycle with a
@@ -110,6 +121,13 @@ class MoAmWaterApiClient:
             _LOGGER.debug("MyWater login completed via silent Okta SSO replay (no reauth needed)")
             self._store_tokens(sso_result)
             return
+
+        if not allow_interactive:
+            _LOGGER.debug(
+                "MyWater silent reauth failed and interactive login is disallowed here; "
+                "deferring to the reauth flow instead of sending an OTP"
+            )
+            raise MfaRequired([])
 
         result = await self._auth.async_start_login(self._username, self._password)
         self._store_tokens(result)

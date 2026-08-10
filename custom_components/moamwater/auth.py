@@ -144,17 +144,19 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 from http.cookies import SimpleCookie
 import re
 import secrets
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import aiohttp
 from yarl import URL
 
 from .const import (
+    COOKIE_JAR_FILENAME_TEMPLATE,
     MYWATER_BASE_URL,
     OKTA_BASE_URL,
     OKTA_CLIENT_ID,
@@ -166,6 +168,9 @@ from .const import (
     OKTA_REDIRECT_URI,
     OKTA_SCOPES,
 )
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -639,6 +644,55 @@ class MoAmWaterAuthClient:
                 self._session.cookie_jar.update_cookies(
                     {k: m.value for k, m in parsed.items()}, response_url=response_url
                 )
+
+
+def _cookie_jar_path(hass: "HomeAssistant", entry_id: str) -> str:
+    return hass.config.path(".storage", COOKIE_JAR_FILENAME_TEMPLATE.format(entry_id=entry_id))
+
+
+async def async_create_session_with_saved_cookies(
+    hass: "HomeAssistant", entry_id: str
+) -> aiohttp.ClientSession:
+    """Create a dedicated ``ClientSession`` (its own real ``CookieJar``) and
+    load Okta's session cookies persisted from a prior run, if any.
+
+    HA's shared ``async_get_clientsession()`` session is unsuitable here: HA
+    docs explicitly warn against using it when an integration needs cookies,
+    and even if used, its cookie jar only lives in memory for the current
+    process -- it's empty again after every genuine HA restart (not just a
+    config-entry reload). That meant `async_try_silent_sso()`'s Okta-session
+    replay could never actually succeed across a reboot, so a real restart
+    that outlasted the ~10hr access-token lifetime always fell through to a
+    full interactive login and a new OTP text, no matter how recently the
+    user had last authenticated. Persisting the jar to disk (paired with
+    `async_save_session_cookies` on unload/shutdown) lets tier 2 (silent SSO)
+    actually work across reboots, which is the main lever for reducing how
+    often OTPs get sent at all.
+    """
+    jar = aiohttp.CookieJar()
+    path = _cookie_jar_path(hass, entry_id)
+    if os.path.exists(path):
+        try:
+            await hass.async_add_executor_job(jar.load, path)
+        except Exception:  # noqa: BLE001 - a corrupt/old jar file must never block startup
+            _LOGGER.debug("Could not load saved MyWater cookie jar at %s", path, exc_info=True)
+    return aiohttp.ClientSession(cookie_jar=jar)
+
+
+async def async_save_session_cookies(
+    hass: "HomeAssistant", session: aiohttp.ClientSession, entry_id: str
+) -> None:
+    """Persist the session's current cookie jar to disk (see
+    `async_create_session_with_saved_cookies`). Call this on unload/reload
+    and on HA shutdown so Okta's session cookies (and thus the ability to do
+    a silent SSO replay) survive a real restart.
+    """
+    path = _cookie_jar_path(hass, entry_id)
+    try:
+        await hass.async_add_executor_job(lambda: os.makedirs(os.path.dirname(path), exist_ok=True))
+        await hass.async_add_executor_job(session.cookie_jar.save, path)
+    except Exception:  # noqa: BLE001 - saving is best-effort; never block shutdown/unload
+        _LOGGER.debug("Could not save MyWater cookie jar to %s", path, exc_info=True)
 
 
 def async_refresh_access_token(*_args: Any, **_kwargs: Any) -> Any:
