@@ -46,6 +46,12 @@ class MoAmWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
+        # Best-effort: reset Okta's idle session timer every poll cycle so a
+        # short idle timeout (rather than a hard session-lifetime cap) can't
+        # sneak in between the ~10hr access-token expiries. See
+        # api.py's async_maintain_okta_session() docstring for details.
+        await self.client.async_maintain_okta_session()
+
         try:
             hourly = await self.client.async_get_hourly_usage()
             daily = await self.client.async_get_daily_usage(days=30)

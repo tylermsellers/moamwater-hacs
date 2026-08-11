@@ -67,6 +67,11 @@ class MoAmWaterApiClient:
         self.premise_id: str | None = None
         self.state_code: str = "MO"
 
+        # Last time we successfully confirmed Okta's own session is alive
+        # (via a real login OR a silent SSO replay) -- see
+        # async_maintain_okta_session()'s docstring for why this exists.
+        self._last_okta_touch: float | None = None
+
     @property
     def access_token(self) -> str | None:
         return self._access_token
@@ -79,6 +84,7 @@ class MoAmWaterApiClient:
         self._access_token = result["access_token"]
         self.refresh_token = result.get("refresh_token") or self.refresh_token
         self._access_token_expires_at = decode_jwt_exp(self._access_token)
+        self._last_okta_touch = time.time()
 
     async def async_login(self, *, allow_interactive: bool = True) -> None:
         """Log in, avoiding a full interactive (password + SMS) login whenever possible.
@@ -136,6 +142,55 @@ class MoAmWaterApiClient:
         """Complete login after an MFA challenge was raised by async_login()."""
         result = await self._auth.async_submit_mfa(passcode)
         self._store_tokens(result)
+
+    async def async_maintain_okta_session(self, *, min_interval_seconds: float = 3600) -> None:
+        """Proactively replay `/v1/authorize` to keep Okta's own session alive,
+        instead of only doing so when the ~10hr MyWater access_token expires.
+
+        Why this exists: `async_login()`'s tier 2 (silent SSO) only ever gets
+        exercised when the access_token has already expired -- roughly every
+        10 hours. If MoAmWater's Okta tenant enforces an *idle* timeout
+        shorter than that gap (common for utility SSO tenants, e.g. 1-2hrs
+        of no activity), Okta's session cookie is already dead by the time
+        we go to use it, forcing an unnecessary full interactive reauth even
+        though the session would have stayed alive with more frequent
+        activity. Calling this once an hour (piggybacked on the regular
+        coordinator poll, well inside a plausible idle-timeout window) resets
+        Okta's idle timer far more often, so only a tenant-enforced *absolute*
+        session lifetime (which no amount of activity can extend) would still
+        force a reauth.
+
+        This is best-effort and never raises: a failure here just means the
+        next `async_login()` call will discover the dead session itself (and
+        fall back to reauth) the normal way.
+        """
+        now = time.time()
+        if self._last_okta_touch is not None and now - self._last_okta_touch < min_interval_seconds:
+            return
+
+        elapsed = None if self._last_okta_touch is None else now - self._last_okta_touch
+        try:
+            sso_result = await self._auth.async_try_silent_sso()
+        except Exception:  # noqa: BLE001 - keep-alive must never break a poll
+            _LOGGER.debug("Okta session keep-alive ping raised unexpectedly", exc_info=True)
+            return
+
+        if sso_result is not None:
+            self._store_tokens(sso_result)
+            _LOGGER.debug(
+                "Okta session keep-alive succeeded (%.0f min since last touch); "
+                "idle timer reset",
+                (elapsed or 0) / 60,
+            )
+        else:
+            _LOGGER.info(
+                "Okta session keep-alive found the session already expired "
+                "(%.0f min since last confirmed-alive touch). This suggests "
+                "MoAmWater's Okta tenant enforces a session lifetime shorter "
+                "than that, which cannot be extended by activity alone; a "
+                "full reauth will be required next.",
+                (elapsed or 0) / 60,
+            )
 
     def _headers(self) -> dict[str, str]:
         if not self._access_token:
