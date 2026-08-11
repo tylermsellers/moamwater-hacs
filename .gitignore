@@ -4,6 +4,8 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .mypy_cache/
+.venv-test/
+.venv/
 
 # Editor
 .vscode/
