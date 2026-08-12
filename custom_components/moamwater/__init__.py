@@ -136,6 +136,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
             home_entity_id = entry.options.get(CONF_HOME_USAGE_ENTITY_ID)
             if home_entity_id:
                 await async_import_irrigation_statistics(hass, daily, home_entity_id)
+        except MfaRequired as exc:
+            # Same terminal case as async_setup_entry()/the coordinator: the
+            # session is fully dead, not just stale. The coordinator's own
+            # poll will already have raised ConfigEntryAuthFailed for this,
+            # so just log here rather than starting a second reauth flow.
+            _LOGGER.warning("Could not import MyWater statistics: %s", exc)
         except MoAmWaterApiError as exc:
             _LOGGER.warning("Could not import MyWater statistics: %s", exc)
 

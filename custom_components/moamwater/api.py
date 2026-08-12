@@ -212,16 +212,19 @@ class MoAmWaterApiClient:
             _LOGGER.debug("MyWater request got 401; attempting silent SSO relogin")
             sso_result = await self._auth.async_try_silent_sso()
             if sso_result is None:
-                raise MoAmWaterApiError(
-                    "MyWater session expired; re-authentication (with a new SMS code) is required"
-                )
+                # Okta's own session is also dead (not just the access
+                # token), so only a real password+SMS login can recover
+                # from here -- same terminal case async_login() surfaces as
+                # MfaRequired. Raise the same exception (instead of a plain
+                # MoAmWaterApiError) so the coordinator can turn this into
+                # ConfigEntryAuthFailed and HA starts the reauth flow rather
+                # than leaving the entities silently unavailable.
+                raise MfaRequired([])
             self._store_tokens(sso_result)
             try:
                 return await self._post_once(payload, url=url)
             except _Unauthorized as exc:
-                raise MoAmWaterApiError(
-                    "MyWater session expired; re-authentication (with a new SMS code) is required"
-                ) from exc
+                raise MfaRequired([]) from exc
 
     async def _post_once(self, payload: dict[str, Any], *, url: str = DATA_URL) -> dict[str, Any]:
         try:

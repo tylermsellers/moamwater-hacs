@@ -7,11 +7,12 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import MoAmWaterApiClient, MoAmWaterApiError
-from .auth import MoAmWaterAuthError
+from .auth import MfaRequired, MoAmWaterAuthError
 from .const import DEFAULT_SCAN_INTERVAL_MINUTES, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,8 +56,16 @@ class MoAmWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             hourly = await self.client.async_get_hourly_usage()
             daily = await self.client.async_get_daily_usage(days=30)
+        except MfaRequired as exc:
+            # A mid-poll 401 survived even a silent SSO replay -- Okta's own
+            # session is dead, not just the access_token, so only a fresh
+            # password+SMS login can recover. Raise ConfigEntryAuthFailed
+            # (instead of UpdateFailed) so HA actually starts the reauth
+            # flow and surfaces a notification, rather than leaving the
+            # entities silently unavailable indefinitely.
+            raise ConfigEntryAuthFailed("MyWater requires a new MFA challenge") from exc
         except MoAmWaterAuthError as exc:
-            raise UpdateFailed(f"Authentication error: {exc}") from exc
+            raise ConfigEntryAuthFailed(f"MyWater authentication error: {exc}") from exc
         except MoAmWaterApiError as exc:
             raise UpdateFailed(f"MyWater API error: {exc}") from exc
 
