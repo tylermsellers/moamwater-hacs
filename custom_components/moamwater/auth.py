@@ -219,6 +219,22 @@ _STATE_TOKEN_RE = re.compile(r'"stateToken"\s*:\s*"((?:[^"\\]|\\.)*)"')
 # browser" behavior) -- letting us skip password + SMS entirely.
 OKTA_SESSION_COOKIE_NAMES = ("sid", "JSESSIONID", "t", "DT", "xids")
 
+# DT specifically is Okta's long-lived (~2yr, per a captured HAR) device-trust
+# cookie -- distinct from `sid`, which is Okta's much shorter-lived
+# authenticated-browser-session cookie. Both ride along on every
+# `/v1/authorize` call, so a single log line naming exactly which of these
+# are present right before a silent-SSO attempt (and, on failure, restating
+# that) is what lets us tell apart two very different root causes the next
+# time this fails:
+#   - DT missing entirely -> our persisted cookie jar lost/never captured it
+#     (a bug in async_create_session_with_saved_cookies/async_save_session_cookies,
+#     fixable client-side).
+#   - DT present but Okta still didn't recognize the session -> Okta's risk
+#     engine is rejecting it on some other signal (e.g. source IP/ASN
+#     reputation differing from the browser that minted it), which is NOT
+#     fixable client-side -- periodic reauth would be unavoidable no matter
+#     what cookie we replay.
+
 
 def decode_jwt_exp(token: str) -> float | None:
     """Return the `exp` (epoch seconds) claim from a JWT, or None if undecodable.
@@ -276,6 +292,16 @@ class MoAmWaterAuthClient:
         self._authenticator: dict[str, Any] | None = None
         self._factors: list[dict[str, Any]] = []
 
+    def _okta_cookie_presence(self, url: str) -> dict[str, bool]:
+        """Return {cookie_name: present} for OKTA_SESSION_COOKIE_NAMES as they
+        would actually be sent on a request to `url` right now.
+
+        Uses `filter_cookies()` (not a raw dict scan) so this reflects real
+        domain/path/secure matching -- i.e. exactly what Okta will see.
+        """
+        sent = self._session.cookie_jar.filter_cookies(URL(url))
+        return {name: name in sent for name in OKTA_SESSION_COOKIE_NAMES}
+
     async def async_start_login(self, username: str, password: str) -> dict[str, Any]:
         """Begin login via the real IDX sequence: authorize -> introspect -> identify -> answer.
 
@@ -314,6 +340,11 @@ class MoAmWaterAuthClient:
             "state": secrets.token_urlsafe(16),
         }
         url = f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
+        cookie_state = self._okta_cookie_presence(url)
+        _LOGGER.debug(
+            "Silent SSO: attempting /v1/authorize replay; cookies present: %s",
+            cookie_state,
+        )
         try:
             async with self._session.get(
                 url, headers=_BROWSER_NAV_HEADERS, allow_redirects=False
@@ -322,20 +353,37 @@ class MoAmWaterAuthClient:
                     location = resp.headers.get("Location")
                     if not location:
                         return None
-                    _LOGGER.debug("Silent SSO: /v1/authorize redirected immediately, following chain")
+                    _LOGGER.info(
+                        "Silent SSO: /v1/authorize redirected immediately (cookies present: %s); "
+                        "following chain",
+                        cookie_state,
+                    )
                     return await self._walk_redirects_for_mywater_tokens(location)
 
                 # A 200 here means Okta didn't recognize the session and
                 # served the interactive Sign-In Widget HTML instead --
                 # session expired, must fall back to full interactive login.
-                _LOGGER.debug(
-                    "Silent SSO: /v1/authorize returned status %s (no redirect); "
-                    "Okta session has expired",
+                # Logged at INFO (not debug) specifically so this shows up in
+                # HA's default log buffer without needing debug logging
+                # enabled in advance -- this is the exact line that tells us,
+                # after the fact, whether DT (Okta's long-lived device-trust
+                # cookie) was present but still rejected (implicating
+                # server-side risk scoring, e.g. IP/ASN reputation -- not
+                # fixable client-side) versus missing entirely (implicating
+                # our own cookie-jar persistence -- fixable client-side).
+                _LOGGER.info(
+                    "Silent SSO: /v1/authorize returned status %s (no redirect); Okta session has "
+                    "expired despite these cookies being present: %s",
                     resp.status,
+                    cookie_state,
                 )
                 return None
         except (MoAmWaterAuthError, aiohttp.ClientError) as exc:
-            _LOGGER.debug("Silent SSO attempt failed: %s", exc)
+            _LOGGER.info(
+                "Silent SSO attempt failed with cookies present: %s -- error: %s",
+                cookie_state,
+                exc,
+            )
             return None
 
     async def async_submit_mfa(self, passcode: str) -> dict[str, Any]:
