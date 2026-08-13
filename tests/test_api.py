@@ -75,21 +75,90 @@ class TestAsyncLogin:
 
         await client.async_login(allow_interactive=True)
 
-        client._auth.async_start_login.assert_awaited_once_with("user@example.com", "hunter2")
+        client._auth.async_start_login.assert_awaited_once_with(
+            "user@example.com", "hunter2", allow_otp_send=True
+        )
         assert client.access_token == "interactive-token"
 
-    async def test_raises_mfarequired_instead_of_interactive_login_when_disallowed(self):
-        """This is the core of the v1.1.0 fix: a background restart/poll must
-        never trigger a real password+SMS login -- it should surface
-        MfaRequired (-> ConfigEntryAuthFailed -> HA reauth flow) instead.
+    async def test_background_login_uses_password_but_blocks_otp_send(self):
+        """A background recovery may submit the password with the persisted
+        DT cookie, but must forbid the explicit request that sends an OTP.
         """
         client = _make_client()
         client._auth.async_try_silent_sso = AsyncMock(return_value=None)
-        client._auth.async_start_login = AsyncMock()
+        client._auth.async_start_login = AsyncMock(side_effect=auth.MfaRequired([]))
 
         with pytest.raises(auth.MfaRequired):
             await client.async_login(allow_interactive=False)
 
+        client._auth.async_start_login.assert_awaited_once_with(
+            "user@example.com", "hunter2", allow_otp_send=False
+        )
+
+    async def test_background_password_login_succeeds_when_dt_skips_mfa(self, caplog):
+        caplog.set_level("WARNING", logger=api._LOGGER.name)
+        client = _make_client()
+        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
+        client._auth.async_start_login = AsyncMock(
+            return_value={"access_token": "dt-token", "refresh_token": "rt"}
+        )
+
+        await client.async_login(allow_interactive=False)
+
+        assert client.access_token == "dt-token"
+        assert "persisted DT device-trust cookie" in caplog.text
+        client._auth.async_start_login.assert_awaited_once_with(
+            "user@example.com", "hunter2", allow_otp_send=False
+        )
+
+    async def test_background_password_is_attempted_only_once_per_client(self):
+        client = _make_client()
+        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
+        client._auth.async_start_login = AsyncMock(side_effect=auth.MfaRequired([]))
+
+        with pytest.raises(auth.MfaRequired):
+            await client.async_login(allow_interactive=False)
+        with pytest.raises(auth.MfaRequired):
+            await client.async_login(allow_interactive=False)
+
+        client._auth.async_start_login.assert_awaited_once()
+
+    async def test_mid_poll_401_uses_guarded_password_recovery(self):
+        client = _make_client(
+            access_token="stale-token",
+            access_token_expires_at=time.time() + 3600,
+        )
+        client._post_once = AsyncMock(
+            side_effect=[api._Unauthorized("stale-token"), {"result": "recovered"}]
+        )
+        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
+        client._auth.async_start_login = AsyncMock(
+            return_value={"access_token": "dt-token", "refresh_token": "rt"}
+        )
+
+        result = await client._post({"request": "data"})
+
+        assert result == {"result": "recovered"}
+        client._auth.async_start_login.assert_awaited_once_with(
+            "user@example.com", "hunter2", allow_otp_send=False
+        )
+
+    async def test_late_401_does_not_replace_a_concurrently_refreshed_token(self):
+        client = _make_client(
+            access_token="new-token",
+            access_token_expires_at=time.time() + 3600,
+        )
+        client._post_once = AsyncMock(
+            side_effect=[api._Unauthorized("old-token"), {"result": "recovered"}]
+        )
+        client._auth.async_try_silent_sso = AsyncMock()
+        client._auth.async_start_login = AsyncMock()
+
+        result = await client._post({"request": "data"})
+
+        assert result == {"result": "recovered"}
+        assert client.access_token == "new-token"
+        client._auth.async_try_silent_sso.assert_not_called()
         client._auth.async_start_login.assert_not_called()
 
 

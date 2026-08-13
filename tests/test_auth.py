@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
@@ -199,3 +200,73 @@ class TestSilentSso:
                 assert await client.async_try_silent_sso() is None
 
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+class TestOtpGuard:
+    async def test_unattended_login_blocks_explicit_challenge_request(self, caplog):
+        caplog.set_level(logging.WARNING, logger=auth._LOGGER.name)
+        client = auth.MoAmWaterAuthClient(AsyncMock(spec=aiohttp.ClientSession))
+        client._state_handle = "state"
+        client._async_post_idx = AsyncMock()
+        response = {
+            "stateHandle": "state-2",
+            "remediation": {
+                "value": [
+                    {
+                        "name": "authenticator-verification-data",
+                        "value": [
+                            {
+                                "name": "authenticator",
+                                "form": {
+                                    "value": [
+                                        {"name": "id", "value": "phone-id"},
+                                        {
+                                            "name": "enrollmentId",
+                                            "value": "enrollment-id",
+                                        },
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
+        }
+
+        with pytest.raises(auth.MfaRequired):
+            await client._async_handle_remediation(
+                response, allow_otp_send=False
+            )
+
+        client._async_post_idx.assert_not_called()
+        assert "blocked the OTP challenge request" in caplog.text
+
+    async def test_passcode_only_challenge_can_be_submitted(self):
+        client = auth.MoAmWaterAuthClient(AsyncMock(spec=aiohttp.ClientSession))
+        client._state_handle = "state"
+        response = {
+            "stateHandle": "state-2",
+            "remediation": {
+                "value": [
+                    {
+                        "name": "challenge-authenticator",
+                        "value": [{"name": "credentials"}],
+                    }
+                ]
+            },
+        }
+
+        with pytest.raises(auth.MfaRequired):
+            await client._async_handle_remediation(response)
+
+        client._async_post_idx = AsyncMock(
+            return_value={"success": {"href": "https://example.test/success"}}
+        )
+        client._async_finish_from_success_href = AsyncMock(
+            return_value={"access_token": "token"}
+        )
+
+        result = await client.async_submit_mfa("123456")
+
+        assert result == {"access_token": "token"}

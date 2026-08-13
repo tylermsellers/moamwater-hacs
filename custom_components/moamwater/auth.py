@@ -302,12 +302,15 @@ class MoAmWaterAuthClient:
         sent = self._session.cookie_jar.filter_cookies(URL(url))
         return {name: name in sent for name in OKTA_SESSION_COOKIE_NAMES}
 
-    async def async_start_login(self, username: str, password: str) -> dict[str, Any]:
+    async def async_start_login(
+        self, username: str, password: str, *, allow_otp_send: bool = True
+    ) -> dict[str, Any]:
         """Begin login via the real IDX sequence: authorize -> introspect -> identify -> answer.
 
         Returns the token dict on immediate success (no further MFA
         configured), or raises MfaRequired if a factor challenge must be
-        completed via async_submit_mfa().
+        completed via async_submit_mfa(). When ``allow_otp_send`` is false,
+        the flow stops before explicitly requesting an SMS/voice challenge.
         """
         _LOGGER.debug("Starting MyWater login for user %s", username)
 
@@ -315,7 +318,9 @@ class MoAmWaterAuthClient:
         self._state_handle = await self._async_introspect(state_token)
         response = await self._async_identify(username)
         response = await self._async_answer_password(password, response)
-        return await self._async_handle_remediation(response)
+        return await self._async_handle_remediation(
+            response, allow_otp_send=allow_otp_send
+        )
 
     async def async_try_silent_sso(self) -> dict[str, Any] | None:
         """Attempt to obtain fresh tokens without any user interaction, by
@@ -394,7 +399,7 @@ class MoAmWaterAuthClient:
 
     async def async_submit_mfa(self, passcode: str) -> dict[str, Any]:
         """Submit the MFA passcode (SMS/email/TOTP code) to complete login."""
-        if not self._state_handle or not self._authenticator:
+        if not self._state_handle:
             raise MoAmWaterAuthError("No active login session; call async_start_login first")
 
         response = await self._async_post_idx(
@@ -499,10 +504,19 @@ class MoAmWaterAuthClient:
                 )
         return data
 
-    async def _async_handle_remediation(self, response: dict[str, Any]) -> dict[str, Any]:
+    async def _async_handle_remediation(
+        self, response: dict[str, Any], *, allow_otp_send: bool = True
+    ) -> dict[str, Any]:
         """Inspect an IDX response and either finish login, trigger the next
         factor challenge automatically (e.g. requesting an SMS code be
         sent), or raise MfaRequired for the caller to supply a passcode.
+
+        ``allow_otp_send=False`` is used only by unattended recovery. It
+        allows a remembered-device password login to finish if Okta accepts
+        the persisted DT cookie, but refuses this client's explicit IDX
+        request to send an SMS/voice code when Okta still requires MFA.
+        Okta may still auto-trigger a factor before returning a passcode-only
+        remediation; that path is logged at WARNING and surfaced to reauth.
         """
         self._state_handle = response.get("stateHandle", self._state_handle)
 
@@ -526,7 +540,15 @@ class MoAmWaterAuthClient:
                     f.get("name") == "credentials" for f in fields
                 ) and not any(f.get("name") == "authenticator" for f in fields)
                 if needs_passcode_only:
-                    self._factors = [{"id": "current"}]
+                    self._authenticator = {"id": "current"}
+                    self._factors = [self._authenticator]
+                    if not allow_otp_send:
+                        _LOGGER.warning(
+                            "Unattended password login reached a passcode-only MFA "
+                            "challenge; Okta may already have sent an OTP. "
+                            "Remediation steps: %s",
+                            names,
+                        )
                     raise MfaRequired(self._factors)
 
         # Case 2: the next step is choosing/triggering a factor (e.g. "send
@@ -544,6 +566,15 @@ class MoAmWaterAuthClient:
                 )
                 if authenticator:
                     self._authenticator = authenticator
+                    if not allow_otp_send:
+                        self._factors = [authenticator]
+                        _LOGGER.warning(
+                            "Unattended password login was accepted but Okta still "
+                            "requires MFA; blocked the OTP challenge request. "
+                            "Remediation steps: %s",
+                            names,
+                        )
+                        raise MfaRequired(self._factors)
                     triggered = await self._async_post_idx(
                         OKTA_IDX_CHALLENGE_URL,
                         {"authenticator": authenticator, "stateHandle": self._state_handle},
