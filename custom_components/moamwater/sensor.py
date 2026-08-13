@@ -83,7 +83,7 @@ class MoAmWaterLastHourUsageSensor(_MoAmWaterBaseSensor):
                 name="Last Hour Water Usage",
                 icon="mdi:water-outline",
                 device_class=SensorDeviceClass.WATER,
-                state_class=SensorStateClass.MEASUREMENT,
+                state_class=SensorStateClass.TOTAL,
                 native_unit_of_measurement=UnitOfVolume.GALLONS,
             ),
         )
