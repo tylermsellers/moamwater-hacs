@@ -363,15 +363,21 @@ class MoAmWaterAuthClient:
                 # A 200 here means Okta didn't recognize the session and
                 # served the interactive Sign-In Widget HTML instead --
                 # session expired, must fall back to full interactive login.
-                # Logged at INFO (not debug) specifically so this shows up in
-                # HA's default log buffer without needing debug logging
-                # enabled in advance -- this is the exact line that tells us,
-                # after the fact, whether DT (Okta's long-lived device-trust
-                # cookie) was present but still rejected (implicating
-                # server-side risk scoring, e.g. IP/ASN reputation -- not
-                # fixable client-side) versus missing entirely (implicating
-                # our own cookie-jar persistence -- fixable client-side).
-                _LOGGER.info(
+                # Logged at WARNING (not info/debug) specifically so this
+                # survives on instances with on-disk file logging disabled:
+                # HA's in-memory system-log buffer -- the only thing readable
+                # in that case -- retains WARNING and above ONLY, so an INFO
+                # line here is silently discarded and the next reauth can't be
+                # diagnosed at all (exactly what happened in v1.1.3). This is
+                # the one line that tells us, after the fact, whether DT
+                # (Okta's long-lived device-trust cookie) was present but
+                # still rejected (implicating server-side risk scoring, e.g.
+                # IP/ASN reputation -- not fixable client-side) versus missing
+                # entirely (implicating our own cookie-jar persistence --
+                # fixable client-side). It fires at most once per silent-SSO
+                # failure, i.e. only when a reauth is imminent anyway, so it
+                # is not log spam.
+                _LOGGER.warning(
                     "Silent SSO: /v1/authorize returned status %s (no redirect); Okta session has "
                     "expired despite these cookies being present: %s",
                     resp.status,
@@ -379,7 +385,7 @@ class MoAmWaterAuthClient:
                 )
                 return None
         except (MoAmWaterAuthError, aiohttp.ClientError) as exc:
-            _LOGGER.info(
+            _LOGGER.warning(
                 "Silent SSO attempt failed with cookies present: %s -- error: %s",
                 cookie_state,
                 exc,

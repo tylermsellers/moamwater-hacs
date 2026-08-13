@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import time
 
@@ -162,7 +163,32 @@ class TestSilentSso:
 
         assert result is None
 
-    async def test_returns_none_on_network_error(self):
+    async def test_expired_session_logs_cookie_state_at_warning(self, caplog):
+        """The cookie-state diagnostic MUST be WARNING, not INFO.
+
+        On instances with on-disk file logging disabled, the only readable
+        log is HA's in-memory system buffer, which retains WARNING and above
+        only -- an INFO line here is dropped and the next reauth becomes
+        undiagnosable (the v1.1.3 regression this test guards against).
+        """
+        caplog.set_level(logging.WARNING, logger=auth._LOGGER.name)
+        async with aiohttp.ClientSession() as session:
+            client = auth.MoAmWaterAuthClient(session)
+            with aioresponses() as mocked:
+                mocked.get(
+                    re.compile(rf"^{re.escape(auth.AUTHORIZE_URL)}\?.*$"),
+                    status=200,
+                    body="<html>sign-in widget</html>",
+                )
+                assert await client.async_try_silent_sso() is None
+
+        records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert records, "silent-SSO failure must log at WARNING or above"
+        message = records[0].getMessage()
+        assert "DT" in message, "diagnostic must name which Okta cookies were present"
+
+    async def test_network_error_logs_cookie_state_at_warning(self, caplog):
+        caplog.set_level(logging.WARNING, logger=auth._LOGGER.name)
         async with aiohttp.ClientSession() as session:
             client = auth.MoAmWaterAuthClient(session)
             with aioresponses() as mocked:
@@ -170,6 +196,6 @@ class TestSilentSso:
                     re.compile(rf"^{re.escape(auth.AUTHORIZE_URL)}\?.*$"),
                     exception=aiohttp.ClientConnectionError(),
                 )
-                result = await client.async_try_silent_sso()
+                assert await client.async_try_silent_sso() is None
 
-        assert result is None
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
