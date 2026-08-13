@@ -111,7 +111,11 @@ class TestAsyncLogin:
             "user@example.com", "hunter2", allow_otp_send=False
         )
 
-    async def test_background_password_is_attempted_only_once_per_client(self):
+    async def test_background_password_is_not_retried_within_cooldown(self):
+        """A failed unattended attempt must not be retried again immediately
+        -- only after the cooldown window has passed -- to bound
+        account-lockout exposure from rapid repeated failures.
+        """
         client = _make_client()
         client._auth.async_try_silent_sso = AsyncMock(return_value=None)
         client._auth.async_start_login = AsyncMock(side_effect=auth.MfaRequired([]))
@@ -122,6 +126,31 @@ class TestAsyncLogin:
             await client.async_login(allow_interactive=False)
 
         client._auth.async_start_login.assert_awaited_once()
+
+    async def test_background_password_is_retried_after_cooldown_elapses(self):
+        """Unlike the old one-shot-per-client-lifetime limiter, an unattended
+        password+DT login must be retried once the cooldown has elapsed --
+        otherwise every access_token expiry after the first would force a
+        user-facing MFA reauth even if DT would have kept working.
+        """
+        client = _make_client()
+        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
+        client._auth.async_start_login = AsyncMock(
+            return_value={"access_token": "dt-token", "refresh_token": "rt"}
+        )
+
+        await client.async_login(allow_interactive=False)
+        assert client.access_token == "dt-token"
+
+        # Simulate the cooldown having elapsed and the token expiring again.
+        client._last_background_password_attempt -= (
+            api._BACKGROUND_PASSWORD_COOLDOWN_SECONDS + 1
+        )
+        client._access_token_expires_at = time.time() - 1
+
+        await client.async_login(allow_interactive=False)
+
+        assert client._auth.async_start_login.await_count == 2
 
     async def test_mid_poll_401_uses_guarded_password_recovery(self):
         client = _make_client(
@@ -208,6 +237,21 @@ class TestMaintainOktaSession:
         # Must not raise even though the underlying session has expired --
         # this is a best-effort keep-alive, not something the poll should fail on.
         await client.async_maintain_okta_session()
+
+    async def test_expired_session_logs_at_warning(self, caplog):
+        """Must log at WARNING (not INFO) so the elapsed-minutes figure --
+        the actual measurement of Okta's idle-timeout tolerance -- survives
+        on instances with file logging disabled (see auth.py's identical
+        WARNING promotion from v1.1.4).
+        """
+        caplog.set_level("WARNING", logger=api._LOGGER.name)
+        client = _make_client()
+        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
+
+        await client.async_maintain_okta_session()
+
+        assert "session already expired" in caplog.text
+        assert caplog.records[-1].levelname == "WARNING"
 
     async def test_unexpected_exception_is_swallowed(self):
         client = _make_client()

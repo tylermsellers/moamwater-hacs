@@ -29,6 +29,21 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# How often an unattended (background) password+DT login may be retried
+# after Okta's own session (the `sid` cookie) has died. Real-world logs show
+# `sid` reliably dies within an hour of the last confirmed-alive touch --
+# far sooner than the ~10hr access_token lifetime -- so silent SSO (tier 2)
+# essentially never succeeds once that hour has passed. Limiting the
+# unattended password+DT fallback (tier 3) to a single attempt for the
+# entire client lifetime (the original behavior) meant every access_token
+# cycle *after the first* forced a user-facing MFA reauth even though DT
+# would likely have kept working indefinitely -- the flag, once set, was
+# never reset. Using a cooldown instead still bounds worst-case lockout
+# exposure (at most one unattended attempt per interval, not one per poll)
+# while letting the DT-remembered-device path keep doing its job across the
+# whole HA runtime, not just once.
+_BACKGROUND_PASSWORD_COOLDOWN_SECONDS = 6 * 3600
+
 DATA_URL = f"{MYWATER_BASE_URL}{MYWATER_DATA_ENDPOINT}"
 MICROAPP_URL = f"{MYWATER_BASE_URL}{MYWATER_MICROAPP_ENDPOINT}"
 PIPELINE_ACCOUNT_SUMMARY = "com::apporchid::cloudseer::mso::myaccountsummarypipeline"
@@ -77,7 +92,7 @@ class MoAmWaterApiClient:
         # async_maintain_okta_session()'s docstring for why this exists.
         self._last_okta_touch: float | None = None
         self._login_lock = asyncio.Lock()
-        self._background_password_attempted = False
+        self._last_background_password_attempt: float | None = None
 
     @property
     def access_token(self) -> str | None:
@@ -127,12 +142,20 @@ class MoAmWaterApiClient:
                 return
 
             if not allow_otp_send:
-                if self._background_password_attempted:
+                now = time.time()
+                if (
+                    self._last_background_password_attempt is not None
+                    and now - self._last_background_password_attempt
+                    < _BACKGROUND_PASSWORD_COOLDOWN_SECONDS
+                ):
                     raise MfaRequired([])
-                # One unattended password submission per client lifetime
-                # limits account-lockout exposure if the stored password is
-                # stale or Okta rejects the request for another reason.
-                self._background_password_attempted = True
+                # Bounding unattended password submissions to a cooldown
+                # (rather than one ever, per client lifetime) limits
+                # account-lockout exposure if the stored password is stale
+                # or Okta rejects the request for another reason, while
+                # still letting the DT-remembered-device path recover on
+                # every subsequent access_token expiry, not just the first.
+                self._last_background_password_attempt = now
 
             _LOGGER.info(
                 "Silent SSO failed; attempting %s password login with the "
@@ -224,7 +247,15 @@ class MoAmWaterApiClient:
                 (elapsed or 0) / 60,
             )
         else:
-            _LOGGER.info(
+            # Promoted to WARNING (from INFO): the `%.0f min` figure is a
+            # direct measurement of how much idle time Okta's tenant
+            # actually tolerates before `sid` dies, which is exactly what's
+            # needed to tell whether `min_interval_seconds` (currently 1hr)
+            # is too infrequent to ever catch the session while still alive.
+            # An INFO line here would be silently dropped on instances with
+            # file logging disabled, same reasoning as the WARNING promotion
+            # in auth.py's async_try_silent_sso() (v1.1.4).
+            _LOGGER.warning(
                 "Okta session keep-alive found the session already expired "
                 "(%.0f min since last confirmed-alive touch). This suggests "
                 "MoAmWater's Okta tenant enforces a session lifetime shorter "
