@@ -1,8 +1,8 @@
 """Push MyWater daily usage into Home Assistant's long-term statistics.
 
 Mirrors the pattern used by the Spire gas integration (`spire_gas:usage_*`):
-an external statistic ID with `has_sum=True`, `has_mean=False`, so it can be
-added directly as a water source on the Energy dashboard.
+an external statistic ID with `has_sum=True`, `mean_type=StatisticMeanType.NONE`,
+so it can be added directly as a water source on the Energy dashboard.
 """
 
 from __future__ import annotations
@@ -10,7 +10,12 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
@@ -39,7 +44,7 @@ async def async_import_daily_statistics(hass: HomeAssistant, daily_usage: dict) 
         _LOGGER.debug("No daily usage data available to import as statistics")
         return
 
-    last_stats = await hass.async_add_executor_job(
+    last_stats = await get_instance(hass).async_add_executor_job(
         get_last_statistics, hass, 1, STATISTIC_ID, True, {"sum"}
     )
     running_sum = 0.0
@@ -74,7 +79,7 @@ async def async_import_daily_statistics(hass: HomeAssistant, daily_usage: dict) 
         return
 
     metadata = StatisticMetaData(
-        has_mean=False,
+        mean_type=StatisticMeanType.NONE,
         has_sum=True,
         name="MyWater Usage",
         source=_DOMAIN_PREFIX,
@@ -123,7 +128,7 @@ async def async_import_irrigation_statistics(
         datetime(parsed_days[-1][0].year, parsed_days[-1][0].month, parsed_days[-1][0].day)
     ) + timedelta(days=1)
 
-    home_stats = await hass.async_add_executor_job(
+    home_stats = await get_instance(hass).async_add_executor_job(
         statistics_during_period,
         hass,
         range_start,
@@ -143,7 +148,7 @@ async def async_import_irrigation_statistics(
         )
         home_by_date[(row_dt.year, row_dt.month, row_dt.day)] = row.get("state") or 0.0
 
-    last_stats = await hass.async_add_executor_job(
+    last_stats = await get_instance(hass).async_add_executor_job(
         get_last_statistics, hass, 1, STATISTIC_ID_IRRIGATION, True, {"sum"}
     )
     running_sum = 0.0
@@ -167,7 +172,7 @@ async def async_import_irrigation_statistics(
         return
 
     metadata = StatisticMetaData(
-        has_mean=False,
+        mean_type=StatisticMeanType.NONE,
         has_sum=True,
         name="MyWater Irrigation Estimate",
         source=_DOMAIN_PREFIX,
