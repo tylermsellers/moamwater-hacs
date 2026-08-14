@@ -270,3 +270,76 @@ class TestOtpGuard:
         result = await client.async_submit_mfa("123456")
 
         assert result == {"access_token": "token"}
+
+
+class TestStartLoginSkipsRedundantSteps:
+    """Okta's IDX state machine doesn't always require identify+password:
+    a persisted device-trust (DT) cookie can make introspect() jump straight
+    to a later remediation. async_start_login() must follow whatever
+    introspect() actually reports instead of blindly calling identify then
+    answer-password, or Okta rejects the out-of-order request with an
+    "Invalid operation for the current authentication" error.
+    """
+
+    def _client(self) -> auth.MoAmWaterAuthClient:
+        client = auth.MoAmWaterAuthClient(AsyncMock(spec=aiohttp.ClientSession))
+        client._async_get_initial_state_token = AsyncMock(return_value="state-token")
+        return client
+
+    async def test_normal_flow_still_calls_identify_and_password(self):
+        client = self._client()
+        client._async_introspect = AsyncMock(
+            return_value={
+                "stateHandle": "s0",
+                "remediation": {"value": [{"name": "identify"}]},
+            }
+        )
+        client._async_identify = AsyncMock(
+            return_value={
+                "stateHandle": "s1",
+                "remediation": {"value": [{"name": "challenge-authenticator"}]},
+            }
+        )
+        client._async_answer_password = AsyncMock(return_value={"stateHandle": "s2"})
+        client._async_handle_remediation = AsyncMock(return_value={"access_token": "tok"})
+
+        result = await client.async_start_login("user", "pass")
+
+        client._async_identify.assert_awaited_once_with("user")
+        client._async_answer_password.assert_awaited_once()
+        assert result == {"access_token": "tok"}
+
+    async def test_skips_identify_when_okta_already_recognizes_device(self):
+        client = self._client()
+        # introspect() jumps straight to a password challenge because a
+        # persisted DT cookie already identified the user.
+        client._async_introspect = AsyncMock(
+            return_value={
+                "stateHandle": "s0",
+                "remediation": {"value": [{"name": "challenge-authenticator"}]},
+            }
+        )
+        client._async_identify = AsyncMock()
+        client._async_answer_password = AsyncMock(return_value={"stateHandle": "s1"})
+        client._async_handle_remediation = AsyncMock(return_value={"access_token": "tok"})
+
+        result = await client.async_start_login("user", "pass")
+
+        client._async_identify.assert_not_called()
+        client._async_answer_password.assert_awaited_once()
+        assert result == {"access_token": "tok"}
+
+    async def test_skips_both_steps_when_introspect_already_finished(self):
+        client = self._client()
+        client._async_introspect = AsyncMock(
+            return_value={"stateHandle": "s0", "success": {"href": "https://x/success"}}
+        )
+        client._async_identify = AsyncMock()
+        client._async_answer_password = AsyncMock()
+        client._async_handle_remediation = AsyncMock(return_value={"access_token": "tok"})
+
+        result = await client.async_start_login("user", "pass")
+
+        client._async_identify.assert_not_called()
+        client._async_answer_password.assert_not_called()
+        assert result == {"access_token": "tok"}

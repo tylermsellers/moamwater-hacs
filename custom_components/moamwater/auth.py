@@ -315,12 +315,36 @@ class MoAmWaterAuthClient:
         _LOGGER.debug("Starting MyWater login for user %s", username)
 
         state_token = await self._async_get_initial_state_token()
-        self._state_handle = await self._async_introspect(state_token)
-        response = await self._async_identify(username)
-        response = await self._async_answer_password(password, response)
+        response = await self._async_introspect(state_token)
+
+        # Okta's IDX state machine does not always start at "identify": when
+        # a persisted device-trust (DT) cookie already recognizes this
+        # browser/session, introspect can jump straight past identify to a
+        # password/MFA remediation. Unconditionally POSTing to
+        # /idp/idx/identify in that case is invalid for the current state,
+        # and Okta rejects it with "Invalid operation for the current
+        # authentication. Expected: AUTHENTICATE, Attempted: [IDENTIFY]" --
+        # which used to abort the whole login (forcing a needless
+        # user-facing reauth) instead of just skipping the redundant step.
+        if self._remediation_has(response, "identify"):
+            response = await self._async_identify(username)
+
+        if self._remediation_has(
+            response, "challenge-authenticator", "select-authenticator-authenticate"
+        ):
+            response = await self._async_answer_password(password, response)
+
         return await self._async_handle_remediation(
             response, allow_otp_send=allow_otp_send
         )
+
+    @staticmethod
+    def _remediation_has(response: dict[str, Any], *names: str) -> bool:
+        """Return whether any of `names` appears in an IDX response's
+        `remediation.value[].name` list."""
+        remediation = ((response.get("remediation") or {}).get("value")) or []
+        present = {r.get("name") for r in remediation}
+        return any(name in present for name in names)
 
     async def async_try_silent_sso(self) -> dict[str, Any] | None:
         """Attempt to obtain fresh tokens without any user interaction, by
@@ -444,8 +468,13 @@ class MoAmWaterAuthClient:
             raise MoAmWaterAuthError("oktaData stateToken was empty")
         return state_token
 
-    async def _async_introspect(self, state_token: str) -> str:
-        """POST /idp/idx/introspect {stateToken} -> stateHandle."""
+    async def _async_introspect(self, state_token: str) -> dict[str, Any]:
+        """POST /idp/idx/introspect {stateToken} -> initial IDX state/remediation.
+
+        Returns the full response (not just `stateHandle`) so the caller can
+        inspect `remediation` to decide which step Okta actually expects
+        next -- see `async_start_login()`'s `_remediation_has()` check.
+        """
         async with self._session.post(
             OKTA_IDX_INTROSPECT_URL,
             json={"stateToken": state_token},
@@ -461,7 +490,8 @@ class MoAmWaterAuthClient:
         state_handle = data.get("stateHandle")
         if not state_handle:
             raise MoAmWaterAuthError(f"/idp/idx/introspect response missing stateHandle: {data}")
-        return state_handle
+        self._state_handle = state_handle
+        return data
 
     async def _async_identify(self, username: str) -> dict[str, Any]:
         """POST /idp/idx/identify {identifier, stateHandle} -> next remediation."""
