@@ -45,6 +45,7 @@ from .api import MoAmWaterApiClient, MoAmWaterApiError
 from .auth import (
     MfaRequired,
     MoAmWaterAuthError,
+    async_adopt_pending_cookie_jar,
     async_create_session_with_saved_cookies,
     async_save_session_cookies,
 )
@@ -55,6 +56,7 @@ from .const import (
     CONF_CONNECTION_CONTRACT_NUMBER,
     CONF_HOME_USAGE_ENTITY_ID,
     CONF_PASSWORD,
+    CONF_PENDING_COOKIE_KEY,
     CONF_PREMISE_ID,
     CONF_REFRESH_TOKEN,
     CONF_STATE_CODE,
@@ -83,6 +85,21 @@ type MoAmWaterConfigEntry = ConfigEntry[MoAmWaterRuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) -> bool:
     """Set up MyWater for this account config entry."""
+    # If this entry was just created by the initial (non-reauth) config
+    # flow, adopt the Okta cookies it saved under its own flow_id into this
+    # entry's permanent cookie-jar file before creating the session below --
+    # otherwise those first `sid`/`DT` cookies would be silently lost and
+    # the very first access_token expiry (~10hr from now) would always
+    # force an interactive MFA reauth. See
+    # `auth.async_adopt_pending_cookie_jar`'s docstring for the full story.
+    pending_cookie_key = entry.data.get(CONF_PENDING_COOKIE_KEY)
+    if pending_cookie_key:
+        await async_adopt_pending_cookie_jar(hass, pending_cookie_key, entry.entry_id)
+        hass.config_entries.async_update_entry(
+            entry,
+            data={k: v for k, v in entry.data.items() if k != CONF_PENDING_COOKIE_KEY},
+        )
+
     # A dedicated session (not HA's shared one) with a real, disk-persisted
     # cookie jar -- see async_create_session_with_saved_cookies's docstring
     # for why this matters for minimizing OTPs across real HA restarts.

@@ -69,21 +69,28 @@ class MoAmWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except MoAmWaterApiError as exc:
             raise UpdateFailed(f"MyWater API error: {exc}") from exc
 
-        self._async_persist_refresh_token_if_rotated()
+        self._async_persist_tokens_if_changed()
         return {"hourly": hourly, "daily": daily}
 
-    def _async_persist_refresh_token_if_rotated(self) -> None:
-        """Okta rotates the refresh_token on every redemption. If a mid-poll
-        401 triggered a re-login (see api.py's `_post`), persist the new
-        refresh_token immediately so the next HA restart doesn't try an
-        already-invalidated one.
+    def _async_persist_tokens_if_changed(self) -> None:
+        """Persist the client's current access_token/expiry/refresh_token into
+        the config entry if any of them changed since the last poll.
+
+        Silent SSO replays (both the hourly keepalive and a mid-poll 401
+        recovery) mint a fresh access_token -- and Okta rotates the
+        refresh_token on every redemption -- entirely in-memory. Previously
+        only a rotated refresh_token got persisted here, so an abrupt
+        restart (crash, forced container restart, power loss -- anything
+        that skips the clean `async_unload_entry` path) would silently
+        discard an hours-old, still-valid access_token and fall back to
+        entry.data's original (older, possibly already-expired) one,
+        forcing an avoidable reauth. Persisting after every poll (not just
+        at setup/unload) closes that gap. Deferred import avoids a circular
+        import with `__init__.py` (which imports this coordinator).
         """
-        from .const import CONF_REFRESH_TOKEN
+        from . import _async_persist_tokens_if_changed
 
         entry = self.hass.config_entries.async_get_entry(self.entry_id)
-        if entry is None or not self.client.refresh_token:
+        if entry is None:
             return
-        if self.client.refresh_token != entry.data.get(CONF_REFRESH_TOKEN):
-            self.hass.config_entries.async_update_entry(
-                entry, data={**entry.data, CONF_REFRESH_TOKEN: self.client.refresh_token}
-            )
+        _async_persist_tokens_if_changed(self.hass, entry, self.client)

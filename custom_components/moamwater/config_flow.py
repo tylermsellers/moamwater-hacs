@@ -34,7 +34,6 @@ from homeassistant.config_entries import (
     OptionsFlow,
 )
 from homeassistant.helpers import selector
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import MoAmWaterApiClient, MoAmWaterApiError
 from .auth import (
@@ -52,6 +51,7 @@ from .const import (
     CONF_CONNECTION_CONTRACT_NUMBER,
     CONF_HOME_USAGE_ENTITY_ID,
     CONF_PASSWORD,
+    CONF_PENDING_COOKIE_KEY,
     CONF_PREMISE_ID,
     CONF_REFRESH_TOKEN,
     CONF_STATE_CODE,
@@ -84,7 +84,11 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         self._username: str | None = None
         self._password: str | None = None
         self._api: MoAmWaterApiClient | None = None
-        self._session: Any = None  # aiohttp.ClientSession, only set/persisted during reauth
+        # aiohttp.ClientSession backed by a disk-persisted cookie jar, used
+        # for both initial setup and reauth so Okta's session cookies from
+        # this flow's login survive to be replayed later (see
+        # `_async_finish_setup` and `async_step_reauth_confirm`).
+        self._session: Any = None
 
     @staticmethod
     def async_get_options_flow(config_entry: ConfigEntry) -> "MoAmWaterOptionsFlow":
@@ -98,8 +102,18 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._username = user_input[CONF_USERNAME]
             self._password = user_input[CONF_PASSWORD]
-            session = async_get_clientsession(self.hass)
-            self._api = MoAmWaterApiClient(session, self._username, self._password)
+            # Use the same disk-persisted-cookie-jar session type reauth
+            # uses (keyed by this flow's own flow_id, since no entry_id
+            # exists yet) rather than HA's shared session -- otherwise the
+            # Okta session cookies from this very first login would only
+            # ever live in memory and be gone by the time the ~10hr
+            # access_token expires, forcing an avoidable reauth almost
+            # immediately after setup. See `_async_finish_setup` for how
+            # these get adopted into the entry's permanent cookie-jar file.
+            self._session = await async_create_session_with_saved_cookies(
+                self.hass, self.flow_id
+            )
+            self._api = MoAmWaterApiClient(self._session, self._username, self._password)
 
             try:
                 await self._api.async_login()
@@ -260,6 +274,15 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
             )
 
         self._abort_if_unique_id_configured()
+        if self._session is not None:
+            # Persist this flow's Okta session cookies under its own
+            # flow_id (the entry_id doesn't exist yet) so __init__.py's
+            # first `async_setup_entry` can adopt them into the entry's
+            # permanent cookie-jar file -- see
+            # `auth.async_adopt_pending_cookie_jar`.
+            await async_save_session_cookies(self.hass, self._session, self.flow_id)
+            await self._session.close()
+            data[CONF_PENDING_COOKIE_KEY] = self.flow_id
         return self.async_create_entry(title=f"MyWater ({self._username})", data=data)
 
 

@@ -80,97 +80,35 @@ class TestAsyncLogin:
         )
         assert client.access_token == "interactive-token"
 
-    async def test_background_login_uses_password_but_blocks_otp_send(self):
-        """A background recovery may submit the password with the persisted
-        DT cookie, but must forbid the explicit request that sends an OTP.
+    async def test_background_login_raises_mfa_required_without_password_attempt(self):
+        """A background (unattended) recovery must never submit the stored
+        password: Okta rejects the DT-cookie fallback outright (confirmed
+        2026-08-15), so attempting it only risks account lockout/anomaly
+        detection for no benefit. It must go straight to reauth once
+        silent SSO fails.
         """
         client = _make_client()
         client._auth.async_try_silent_sso = AsyncMock(return_value=None)
-        client._auth.async_start_login = AsyncMock(side_effect=auth.MfaRequired([]))
+        client._auth.async_start_login = AsyncMock()
 
         with pytest.raises(auth.MfaRequired):
             await client.async_login(allow_interactive=False)
 
-        client._auth.async_start_login.assert_awaited_once_with(
-            "user@example.com", "hunter2", allow_otp_send=False
-        )
+        client._auth.async_start_login.assert_not_called()
 
-    async def test_background_password_login_succeeds_when_dt_skips_mfa(self, caplog):
-        caplog.set_level("WARNING", logger=api._LOGGER.name)
-        client = _make_client()
-        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
-        client._auth.async_start_login = AsyncMock(
-            return_value={"access_token": "dt-token", "refresh_token": "rt"}
-        )
-
-        await client.async_login(allow_interactive=False)
-
-        assert client.access_token == "dt-token"
-        assert "persisted DT device-trust cookie" in caplog.text
-        client._auth.async_start_login.assert_awaited_once_with(
-            "user@example.com", "hunter2", allow_otp_send=False
-        )
-
-    async def test_background_password_is_not_retried_within_cooldown(self):
-        """A failed unattended attempt must not be retried again immediately
-        -- only after the cooldown window has passed -- to bound
-        account-lockout exposure from rapid repeated failures.
-        """
-        client = _make_client()
-        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
-        client._auth.async_start_login = AsyncMock(side_effect=auth.MfaRequired([]))
-
-        with pytest.raises(auth.MfaRequired):
-            await client.async_login(allow_interactive=False)
-        with pytest.raises(auth.MfaRequired):
-            await client.async_login(allow_interactive=False)
-
-        client._auth.async_start_login.assert_awaited_once()
-
-    async def test_background_password_is_retried_after_cooldown_elapses(self):
-        """Unlike the old one-shot-per-client-lifetime limiter, an unattended
-        password+DT login must be retried once the cooldown has elapsed --
-        otherwise every access_token expiry after the first would force a
-        user-facing MFA reauth even if DT would have kept working.
-        """
-        client = _make_client()
-        client._auth.async_try_silent_sso = AsyncMock(return_value=None)
-        client._auth.async_start_login = AsyncMock(
-            return_value={"access_token": "dt-token", "refresh_token": "rt"}
-        )
-
-        await client.async_login(allow_interactive=False)
-        assert client.access_token == "dt-token"
-
-        # Simulate the cooldown having elapsed and the token expiring again.
-        client._last_background_password_attempt -= (
-            api._BACKGROUND_PASSWORD_COOLDOWN_SECONDS + 1
-        )
-        client._access_token_expires_at = time.time() - 1
-
-        await client.async_login(allow_interactive=False)
-
-        assert client._auth.async_start_login.await_count == 2
-
-    async def test_mid_poll_401_uses_guarded_password_recovery(self):
+    async def test_mid_poll_401_raises_mfa_required_when_unattended(self):
         client = _make_client(
             access_token="stale-token",
             access_token_expires_at=time.time() + 3600,
         )
-        client._post_once = AsyncMock(
-            side_effect=[api._Unauthorized("stale-token"), {"result": "recovered"}]
-        )
+        client._post_once = AsyncMock(side_effect=api._Unauthorized("stale-token"))
         client._auth.async_try_silent_sso = AsyncMock(return_value=None)
-        client._auth.async_start_login = AsyncMock(
-            return_value={"access_token": "dt-token", "refresh_token": "rt"}
-        )
+        client._auth.async_start_login = AsyncMock()
 
-        result = await client._post({"request": "data"})
+        with pytest.raises(auth.MfaRequired):
+            await client._post({"request": "data"})
 
-        assert result == {"result": "recovered"}
-        client._auth.async_start_login.assert_awaited_once_with(
-            "user@example.com", "hunter2", allow_otp_send=False
-        )
+        client._auth.async_start_login.assert_not_called()
 
     async def test_late_401_does_not_replace_a_concurrently_refreshed_token(self):
         client = _make_client(

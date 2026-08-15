@@ -67,6 +67,13 @@ DATA_EXPIRES_AT = "expires_at"
 CONF_ACCESS_TOKEN = "access_token"
 CONF_ACCESS_TOKEN_EXPIRES_AT = "access_token_expires_at"
 
+# Transient entry.data key: set only right after initial (non-reauth) setup,
+# holding the config flow's own flow_id -- the temporary key its Okta cookie
+# jar was saved under before the real entry_id existed. `__init__.py` reads
+# this once on first setup to adopt those cookies into the entry's permanent
+# jar file, then removes the key from entry.data.
+CONF_PENDING_COOKIE_KEY = "pending_cookie_key"
+
 # Filename (relative to HA's config/.storage dir) used to persist Okta's own
 # session cookies (e.g. `sid`) across restarts, so that even once the access
 # token itself has expired we can try a silent `/v1/authorize` replay (Okta

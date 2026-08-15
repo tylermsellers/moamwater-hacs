@@ -29,21 +29,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# How often an unattended (background) password+DT login may be retried
-# after Okta's own session (the `sid` cookie) has died. Real-world logs show
-# `sid` reliably dies within an hour of the last confirmed-alive touch --
-# far sooner than the ~10hr access_token lifetime -- so silent SSO (tier 2)
-# essentially never succeeds once that hour has passed. Limiting the
-# unattended password+DT fallback (tier 3) to a single attempt for the
-# entire client lifetime (the original behavior) meant every access_token
-# cycle *after the first* forced a user-facing MFA reauth even though DT
-# would likely have kept working indefinitely -- the flag, once set, was
-# never reset. Using a cooldown instead still bounds worst-case lockout
-# exposure (at most one unattended attempt per interval, not one per poll)
-# while letting the DT-remembered-device path keep doing its job across the
-# whole HA runtime, not just once.
-_BACKGROUND_PASSWORD_COOLDOWN_SECONDS = 6 * 3600
-
 DATA_URL = f"{MYWATER_BASE_URL}{MYWATER_DATA_ENDPOINT}"
 MICROAPP_URL = f"{MYWATER_BASE_URL}{MYWATER_MICROAPP_ENDPOINT}"
 PIPELINE_ACCOUNT_SUMMARY = "com::apporchid::cloudseer::mso::myaccountsummarypipeline"
@@ -92,7 +77,6 @@ class MoAmWaterApiClient:
         # async_maintain_okta_session()'s docstring for why this exists.
         self._last_okta_touch: float | None = None
         self._login_lock = asyncio.Lock()
-        self._last_background_password_attempt: float | None = None
 
     @property
     def access_token(self) -> str | None:
@@ -142,37 +126,27 @@ class MoAmWaterApiClient:
                 return
 
             if not allow_otp_send:
-                now = time.time()
-                if (
-                    self._last_background_password_attempt is not None
-                    and now - self._last_background_password_attempt
-                    < _BACKGROUND_PASSWORD_COOLDOWN_SECONDS
-                ):
-                    raise MfaRequired([])
-                # Bounding unattended password submissions to a cooldown
-                # (rather than one ever, per client lifetime) limits
-                # account-lockout exposure if the stored password is stale
-                # or Okta rejects the request for another reason, while
-                # still letting the DT-remembered-device path recover on
-                # every subsequent access_token expiry, not just the first.
-                self._last_background_password_attempt = now
+                # Confirmed (2026-08-15 logs): Okta rejects an unattended
+                # password+DT login for this account outright, returning an
+                # `authenticator-verification-data` remediation that demands
+                # a fresh MFA challenge even with the persisted DT
+                # device-trust cookie presented. So this background path
+                # never actually succeeds -- it only wastes a password
+                # submission (with real account-lockout/anomaly-detection
+                # exposure) on every access_token expiry that outlasts the
+                # `sid` cookie. Go straight to reauth instead of attempting
+                # it; a real interactive login (with allow_otp_send=True,
+                # from the config flow) is the only path that can ever
+                # succeed once silent SSO has failed.
+                raise MfaRequired([])
 
-            _LOGGER.info(
-                "Silent SSO failed; attempting %s password login with the "
-                "persisted Okta DT cookie",
-                "interactive" if allow_otp_send else "OTP-blocked unattended",
-            )
+            _LOGGER.info("Silent SSO failed; attempting interactive password login")
             result = await self._auth.async_start_login(
                 self._username,
                 self._password,
                 allow_otp_send=allow_otp_send,
             )
             self._store_tokens(result)
-            if not allow_otp_send:
-                _LOGGER.warning(
-                    "Unattended password login succeeded without requesting an "
-                    "OTP; Okta accepted the persisted DT device-trust cookie"
-                )
 
     async def async_login(self, *, allow_interactive: bool = True) -> None:
         """Log in, avoiding a full interactive (password + SMS) login whenever possible.

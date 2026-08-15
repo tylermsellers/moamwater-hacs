@@ -810,6 +810,38 @@ async def async_save_session_cookies(
         _LOGGER.debug("Could not save MyWater cookie jar to %s", path, exc_info=True)
 
 
+async def async_adopt_pending_cookie_jar(
+    hass: "HomeAssistant", pending_key: str, entry_id: str
+) -> None:
+    """Move a cookie jar saved under a temporary ``pending_key`` (the config
+    flow's own ``flow_id``, used before the real config-entry ID exists) to
+    its permanent ``entry_id``-keyed path.
+
+    Why this exists: the initial (non-reauth) config flow authenticates
+    against Okta before the config entry -- and thus its ``entry_id`` --
+    exists, so it can't save straight to the entry's own cookie-jar path.
+    Without this adoption step those first Okta session cookies (`sid`/`DT`)
+    were simply discarded once the flow finished, meaning the very first
+    access_token expiry (~10hr after setup) always fell straight through to
+    a full interactive MFA reauth, no matter how fresh the login was. This
+    is best-effort and never raises: worst case is the same behavior as
+    before this existed (a silent-SSO miss on first access_token expiry).
+    """
+    pending_path = _cookie_jar_path(hass, pending_key)
+    final_path = _cookie_jar_path(hass, entry_id)
+    if not os.path.exists(pending_path) or os.path.exists(final_path):
+        return
+    try:
+        await hass.async_add_executor_job(os.replace, pending_path, final_path)
+    except Exception:  # noqa: BLE001 - adoption is best-effort; never block startup
+        _LOGGER.debug(
+            "Could not adopt pending MyWater cookie jar %s into %s",
+            pending_path,
+            final_path,
+            exc_info=True,
+        )
+
+
 def async_refresh_access_token(*_args: Any, **_kwargs: Any) -> Any:
     """Removed: MyWater's Okta app is a confidential OAuth client (needs a
     client secret we don't have), so `grant_type=refresh_token` against
