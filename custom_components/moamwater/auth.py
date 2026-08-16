@@ -217,7 +217,7 @@ _STATE_TOKEN_RE = re.compile(r'"stateToken"\s*:\s*"((?:[^"\\]|\\.)*)"')
 # recognizes the existing session and redirects straight through to a `code`
 # without showing the interactive widget (standard OIDC/SSO "remember this
 # browser" behavior) -- letting us skip password + SMS entirely.
-OKTA_SESSION_COOKIE_NAMES = ("sid", "JSESSIONID", "t", "DT", "xids")
+OKTA_SESSION_COOKIE_NAMES = ("sid", "JSESSIONID", "t", "DT", "xids", "idx")
 
 # DT specifically is Okta's long-lived (~2yr, per a captured HAR) device-trust
 # cookie -- distinct from `sid`, which is Okta's much shorter-lived
@@ -234,6 +234,12 @@ OKTA_SESSION_COOKIE_NAMES = ("sid", "JSESSIONID", "t", "DT", "xids")
 #     reputation differing from the browser that minted it), which is NOT
 #     fixable client-side -- periodic reauth would be unavoidable no matter
 #     what cookie we replay.
+#
+# `idx` is Okta Identity Engine's own browser-session cookie (distinct from
+# the classic-Okta `sid`). Earlier diagnostics only logged `sid`/DT, which
+# conflates "Okta's OIE session is dead" with "our `sid` read is stale" --
+# tracking `idx` alongside `sid` lets a future silent-SSO failure tell those
+# apart instead of assuming the whole session is gone from `sid` alone.
 
 
 def decode_jwt_exp(token: str) -> float | None:
@@ -360,6 +366,19 @@ class MoAmWaterAuthClient:
         genuine network errors) if Okta's session has actually expired and
         the widget HTML is shown instead, so the caller can fall back to a
         full interactive login.
+
+        Passes `prompt=none` (standard OIDC), which asks Okta to never show
+        any interactive UI: per spec, if the session is genuinely dead Okta
+        should redirect straight back to `redirect_uri` with
+        `error=login_required` (or `interaction_required`) instead of
+        serving the Sign-In Widget HTML. Distinguishing "redirected with an
+        explicit OAuth error" from "served the widget anyway" (still handled
+        as a fallback below, since not every OIE tenant's `/v1/authorize`
+        honors `prompt=none` -- some ignore unknown/unsupported prompt
+        values and fall back to their default behavior) is a cheap,
+        standards-based way to confirm whether Okta is treating this as a
+        real "no session" case versus something else (e.g. a step-up/risk
+        decision) without guessing from HTML content.
         """
         authorize_params = {
             "client_id": OKTA_CLIENT_ID,
@@ -367,6 +386,7 @@ class MoAmWaterAuthClient:
             "scope": OKTA_SCOPES,
             "redirect_uri": OKTA_REDIRECT_URI,
             "state": secrets.token_urlsafe(16),
+            "prompt": "none",
         }
         url = f"{AUTHORIZE_URL}?{urlencode(authorize_params)}"
         cookie_state = self._okta_cookie_presence(url)
@@ -381,6 +401,23 @@ class MoAmWaterAuthClient:
                 if resp.status in (301, 302, 303, 307, 308):
                     location = resp.headers.get("Location")
                     if not location:
+                        return None
+                    error = URL(location).query.get("error")
+                    if error:
+                        # `prompt=none` was honored and Okta explicitly told
+                        # us why it can't complete this silently (spec:
+                        # `login_required`/`interaction_required`/
+                        # `consent_required`/etc.) -- log the real reason
+                        # instead of silently falling through to a full
+                        # reauth as if this were an ordinary widget-HTML
+                        # miss.
+                        _LOGGER.warning(
+                            "Silent SSO: /v1/authorize redirected with OAuth error "
+                            "'%s' (%s); cookies present: %s",
+                            error,
+                            URL(location).query.get("error_description", "no description"),
+                            cookie_state,
+                        )
                         return None
                     _LOGGER.info(
                         "Silent SSO: /v1/authorize redirected immediately (cookies present: %s); "

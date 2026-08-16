@@ -91,6 +91,18 @@ class MoAmWaterApiClient:
         self.refresh_token = result.get("refresh_token") or self.refresh_token
         self._access_token_expires_at = decode_jwt_exp(self._access_token)
         self._last_okta_touch = time.time()
+        # Diagnostic only (never log the value itself): confirms on every
+        # successful login/silent-SSO whether `mw_refresh_token` was
+        # actually captured, so a future manual browser test of whether
+        # MyWater redeems it anywhere can at least confirm this client
+        # captures the same cookie a real browser session would have had
+        # available to it.
+        _LOGGER.debug(
+            "Tokens stored: access_token expires at %s; mw_refresh_token present: %s (len %s)",
+            self._access_token_expires_at,
+            bool(self.refresh_token),
+            len(self.refresh_token) if self.refresh_token else 0,
+        )
 
     def _has_valid_access_token(self) -> bool:
         """Return whether the current token is safe to use for a poll."""
