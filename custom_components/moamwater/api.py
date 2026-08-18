@@ -329,6 +329,19 @@ class MoAmWaterApiClient:
         self.state_code = details.get("state") or "MO"
 
         if not all([self.business_partner_number, self.connection_contract_number, self.premise_id]):
+            # WARNING (not debug): on-disk file logging is often disabled for
+            # this install (see auth.py's silent-SSO cookie-state comments),
+            # so this is the only way to ever see *why* discovery failed --
+            # e.g. an empty `IntermediaryPageDetails` from a transient/rate-
+            # limited response vs. a genuine payload-shape change upstream.
+            _LOGGER.warning(
+                "Account summary response missing expected identifiers; "
+                "row count=%s, additionalInformation keys=%s, "
+                "IntermediaryPageDetails=%r",
+                len(summary_rows),
+                sorted((first.get("additionalInformation") or {}).keys()),
+                details,
+            )
             raise MoAmWaterApiError(
                 "Could not determine account identifiers from account summary response"
             )

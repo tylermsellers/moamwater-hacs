@@ -227,6 +227,32 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         try:
             await self._api.async_discover_account()
         except MoAmWaterApiError as exc:
+            # During reauth, the account identifiers are already known and
+            # persisted on the existing entry (they don't change for a given
+            # account) -- login itself just succeeded at this point, so
+            # don't block a whole reauth (and force yet another
+            # password+OTP round-trip) on a re-discovery call that's purely
+            # advisory here. Fall back to the entry's stored identifiers and
+            # only fail if this is the very first setup (nothing to fall
+            # back to) or the entry itself never captured them.
+            if self.source == SOURCE_REAUTH:
+                reauth_entry = self._get_reauth_entry()
+                bpn = reauth_entry.data.get(CONF_BUSINESS_PARTNER_NUMBER)
+                ccn = reauth_entry.data.get(CONF_CONNECTION_CONTRACT_NUMBER)
+                premise_id = reauth_entry.data.get(CONF_PREMISE_ID)
+                if bpn and ccn and premise_id:
+                    _LOGGER.warning(
+                        "MoAmWater account discovery failed during reauth (%s); "
+                        "reusing previously known account identifiers instead "
+                        "of blocking reauth on it",
+                        exc,
+                    )
+                    self._api.business_partner_number = bpn
+                    self._api.connection_contract_number = ccn
+                    self._api.premise_id = premise_id
+                    self._api.state_code = reauth_entry.data.get(CONF_STATE_CODE, "MO")
+                    return await self._async_finish_setup_with_identifiers()
+
             _LOGGER.error("MoAmWater account discovery failed: %s", exc)
             step_id = "reauth_confirm" if self.source == SOURCE_REAUTH else "user"
             schema = (
@@ -242,6 +268,11 @@ class MoAmWaterConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_show_form(
                 step_id=step_id, data_schema=schema, errors={"base": "cannot_connect"}
             )
+
+        return await self._async_finish_setup_with_identifiers()
+
+    async def _async_finish_setup_with_identifiers(self) -> ConfigFlowResult:
+        assert self._api is not None
 
         await self.async_set_unique_id(self._api.connection_contract_number)
 
