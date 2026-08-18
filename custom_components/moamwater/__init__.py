@@ -32,12 +32,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 
 import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.event import async_track_time_interval
 
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
@@ -62,6 +64,7 @@ from .const import (
     CONF_STATE_CODE,
     CONF_USERNAME,
     DOMAIN,
+    OKTA_KEEPALIVE_INTERVAL_MINUTES,
 )
 from .coordinator import MoAmWaterCoordinator
 from .statistics import async_import_daily_statistics, async_import_irrigation_statistics
@@ -145,6 +148,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
     await coordinator.async_config_entry_first_refresh()
 
     entry.runtime_data = MoAmWaterRuntimeData(client=client, coordinator=coordinator, session=session)
+
+    async def _async_keepalive_tick(_now) -> None:
+        # Runs independently of the hourly data-poll coordinator -- see
+        # OKTA_KEEPALIVE_INTERVAL_MINUTES's docstring in const.py for why a
+        # keep-alive piggybacked only on the (much slower) data poll can miss
+        # a short Okta idle-session timeout entirely. This carries no
+        # credentials, so it's safe to run far more often than the data poll.
+        await client.async_maintain_okta_session(
+            min_interval_seconds=OKTA_KEEPALIVE_INTERVAL_MINUTES * 60
+        )
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass,
+            _async_keepalive_tick,
+            timedelta(minutes=OKTA_KEEPALIVE_INTERVAL_MINUTES),
+        )
+    )
 
     async def _async_push_statistics() -> None:
         try:

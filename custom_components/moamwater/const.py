@@ -82,6 +82,17 @@ COOKIE_JAR_FILENAME_TEMPLATE = "moamwater_{entry_id}_cookies.pickle"
 
 DEFAULT_SCAN_INTERVAL_MINUTES = 60
 
+# How often to proactively ping Okta's `/v1/authorize` (silent SSO replay) to
+# reset its own idle-session timer -- decoupled from DEFAULT_SCAN_INTERVAL_MINUTES
+# (the usage-data poll interval) because piggybacking the keep-alive on an
+# hourly poll is too infrequent to catch a tenant-enforced *idle* timeout
+# shorter than an hour before Okta's session (`sid`) cookie already died. This
+# ping carries no credentials (no password, no MFA) -- it only replays
+# existing session cookies, so running it more often than the data poll adds
+# no meaningful risk, just more frequent traffic that looks like normal
+# browsing activity.
+OKTA_KEEPALIVE_INTERVAL_MINUTES = 15
+
 STATISTIC_ID = "moamwater:usage"
 
 # Optional entry option: a home-only water usage sensor (e.g. a Flo/Moen
