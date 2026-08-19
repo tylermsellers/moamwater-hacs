@@ -201,8 +201,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_save_cookies_on_stop)
     )
 
+    # Deliberately NOT registering entry.add_update_listener() here. The only
+    # option (CONF_HOME_USAGE_ENTITY_ID) is already read live from
+    # entry.options inside _async_push_statistics() above, so no reload is
+    # needed when it changes. A prior update-listener that just called
+    # async_reload() fired on ANY entry.data write -- including
+    # _async_persist_tokens_if_changed() and reauth's own
+    # async_update_reload_and_abort() -- causing a second, racing reload
+    # right on top of the intentional one. That race is what let a freshly
+    # completed reauth immediately re-trigger ConfigEntryAuthFailed (the
+    # racing reload's client/session wasn't fully settled yet) and, more
+    # broadly, kept resetting the API client (and its _last_okta_touch
+    # keep-alive bookkeeping) far more often than intended.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
 
 
@@ -241,6 +252,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) -
     return unload_ok
 
 
-async def _async_update_listener(hass: HomeAssistant, entry: MoAmWaterConfigEntry) -> None:
-    """Reload the entry when options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
+
+
