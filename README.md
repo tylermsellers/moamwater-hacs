@@ -80,23 +80,54 @@ form every day:
    detects the session is dead, which triggers Okta's SMS immediately — you
    don't need to call this yourself in the common case.
 2. Set up a way to read that SMS automatically and call
-   `moamwater.submit_mfa_code` with the code. On iPhone this is a personal
-   Shortcuts automation with no third-party app required:
-   - Shortcuts → Automation → **+** → **Message** → filter to MoAmWater's
-     sending number → turn off **Ask Before Running**.
-   - Add a **Get text from input** / **Match text** action with a regex
-     like `\d{6}` to extract the code.
-   - Add a **Get Contents of URL** action: POST to an HA webhook (e.g. your
-     Nabu Casa remote URL or a locally exposed
-     `https://<your-ha>/api/webhook/moamwater_mfa`) with a JSON body
-     `{"code": "<matched text>"}`.
-   - In Home Assistant, add an automation triggered by that
-     `webhook` trigger that calls `moamwater.submit_mfa_code` with
-     `code: "{{ trigger.json.code }}"`.
+   `moamwater.submit_mfa_code` with the code.
 
-The normal "reauthenticate" notification/form still works as a manual
-fallback (e.g. if your credentials themselves changed, or the automation
-doesn't fire) — these services just race it to the punch.
+#### iPhone: a ready-made Shortcut (no third-party app needed)
+
+A working [Shortcuts automation](https://www.icloud.com/shortcuts/d8aa7fd5a93e4ebba1416ff01696966f)
+is available to import directly — it reads the incoming MFA text and posts
+the code to an HA webhook. Importing it will ask you for your own webhook
+URL (nothing of the original author's is baked in).
+To set it up:
+
+1. Open the link above on your iPhone and import it as a **personal
+   automation** triggered by **Message**, filtered to MoAmWater's sending
+   number, with **Ask Before Running** turned off. When prompted, enter
+   your own webhook URL, e.g.
+   `https://<your-nabu-casa-or-public-ha-url>/api/webhook/<your-webhook-id>`
+   — pick your own random-looking webhook ID (treat it like a secret, since
+   it's the only thing authenticating the request).
+2. Create the matching automation in Home Assistant (Settings →
+   Automations → **+ Add Automation** → **Edit in YAML**):
+
+   ```yaml
+   alias: MoAmWater - submit MFA code from SMS
+   description: >-
+     Triggered by an HA webhook that an iPhone Shortcut posts to after
+     reading the MoAmWater/Okta MFA text. Forwards the code to
+     moamwater.submit_mfa_code to finish the automated reauth.
+   triggers:
+     - trigger: webhook
+       webhook_id: <your-webhook-id>   # must match the Shortcut's URL
+       allowed_methods:
+         - POST
+       local_only: false   # required: the Shortcut posts from the internet
+   conditions:
+     - condition: template
+       value_template: >-
+         {{ trigger.json is defined and trigger.json.otp is defined
+            and trigger.json.otp != '' }}
+   actions:
+     - action: moamwater.submit_mfa_code
+       data:
+         code: "{{ trigger.json.otp }}"
+         # entry_id: <only needed with more than one MoAmWater account>
+   mode: single
+   ```
+
+The existing "reauthenticate" UI notification/form still works as a manual
+fallback (e.g. if your credentials change, or the automation doesn't fire)
+— this setup just races it to the punch, confirmed working end-to-end.
 
 ---
 
