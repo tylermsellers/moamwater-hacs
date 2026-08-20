@@ -125,6 +125,13 @@ async def async_start_reauth(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         return True
 
+    if existing is not None:
+        # A previous attempt's cooldown has expired without ever being
+        # completed by submit_mfa_code (e.g. its SMS code was never used) --
+        # close its now-abandoned session/client before starting a fresh
+        # one so repeated start_reauth calls can't leak connections.
+        await existing.session.close()
+
     session = await async_create_session_with_saved_cookies(hass, entry.entry_id)
     client = MoAmWaterApiClient(
         session=session,
