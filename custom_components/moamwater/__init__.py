@@ -67,6 +67,7 @@ from .const import (
     OKTA_KEEPALIVE_INTERVAL_MINUTES,
 )
 from .coordinator import MoAmWaterCoordinator
+from .services import async_setup_services, async_start_reauth
 from .statistics import async_import_daily_statistics, async_import_irrigation_statistics
 
 _LOGGER = logging.getLogger(__name__)
@@ -88,6 +89,13 @@ type MoAmWaterConfigEntry = ConfigEntry[MoAmWaterRuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) -> bool:
     """Set up MyWater for this account config entry."""
+    # Registers moamwater.start_reauth / moamwater.submit_mfa_code once per
+    # HA run (idempotent) -- see services.py's module docstring for why
+    # these exist (letting an automation, e.g. one driven by an iPhone
+    # Shortcut reading the MFA SMS, finish a reauth with zero manual UI
+    # interaction).
+    async_setup_services(hass)
+
     # If this entry was just created by the initial (non-reauth) config
     # flow, adopt the Okta cookies it saved under its own flow_id into this
     # entry's permanent cookie-jar file before creating the session below --
@@ -134,6 +142,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MoAmWaterConfigEntry) ->
     except MfaRequired as exc:
         # Stored-token/silent-login fallback failed; ask HA to trigger reauth.
         await session.close()
+        # Immediately (fire-and-forget) submit the stored credentials on a
+        # *fresh* session so Okta's SMS goes out right away instead of
+        # waiting on a human to open the reauth form -- see services.py's
+        # module docstring for the full automated start_reauth/
+        # submit_mfa_code design this feeds.
+        hass.async_create_task(async_start_reauth(hass, entry))
         raise ConfigEntryAuthFailed("MyWater requires a new MFA challenge") from exc
     except MoAmWaterAuthError as exc:
         await session.close()

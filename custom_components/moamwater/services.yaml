@@ -1,0 +1,38 @@
+start_reauth:
+  name: Start automated MyWater reauth
+  description: >-
+    Submits the stored MyWater username/password to Okta, triggering its SMS
+    MFA challenge. Normally kicked off automatically the moment the
+    integration detects the session is fully dead; call this manually only
+    to retry (e.g. after fixing credentials) without waiting for the next
+    poll cycle.
+  fields:
+    entry_id:
+      name: Config entry
+      description: Which MyWater account to reauth. Omit if only one is configured.
+      required: false
+      selector:
+        config_entry:
+          integration: moamwater
+
+submit_mfa_code:
+  name: Submit MyWater MFA code
+  description: >-
+    Finishes a pending automated reauth (started by start_reauth) with the
+    one-time passcode texted by Okta. Intended to be called by an automation
+    that extracts the code from the incoming SMS (e.g. via an iPhone
+    Shortcut posting to an HA webhook).
+  fields:
+    entry_id:
+      name: Config entry
+      description: Which MyWater account this code is for. Omit if only one is configured.
+      required: false
+      selector:
+        config_entry:
+          integration: moamwater
+    code:
+      name: Code
+      description: The one-time passcode from Okta's SMS.
+      required: true
+      selector:
+        text:

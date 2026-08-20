@@ -68,6 +68,36 @@ fresh MFA challenge again (e.g. due to risk-based re-authentication), Home
 Assistant will surface a "reauthenticate" notification for you to complete
 the MFA step again.
 
+MoAmWater's Okta tenant enforces a hard ~23hr absolute session lifetime that
+no amount of keep-alive activity can extend, and MFA for this account is
+SMS-only — so a reauth roughly once a day is effectively unavoidable, and
+the code always arrives by text. Two services,
+`moamwater.start_reauth`/`moamwater.submit_mfa_code`, let an automation
+finish that reauth for you automatically instead of tapping through the UI
+form every day:
+
+1. The integration itself calls `start_reauth` automatically the instant it
+   detects the session is dead, which triggers Okta's SMS immediately — you
+   don't need to call this yourself in the common case.
+2. Set up a way to read that SMS automatically and call
+   `moamwater.submit_mfa_code` with the code. On iPhone this is a personal
+   Shortcuts automation with no third-party app required:
+   - Shortcuts → Automation → **+** → **Message** → filter to MoAmWater's
+     sending number → turn off **Ask Before Running**.
+   - Add a **Get text from input** / **Match text** action with a regex
+     like `\d{6}` to extract the code.
+   - Add a **Get Contents of URL** action: POST to an HA webhook (e.g. your
+     Nabu Casa remote URL or a locally exposed
+     `https://<your-ha>/api/webhook/moamwater_mfa`) with a JSON body
+     `{"code": "<matched text>"}`.
+   - In Home Assistant, add an automation triggered by that
+     `webhook` trigger that calls `moamwater.submit_mfa_code` with
+     `code: "{{ trigger.json.code }}"`.
+
+The normal "reauthenticate" notification/form still works as a manual
+fallback (e.g. if your credentials themselves changed, or the automation
+doesn't fire) — these services just race it to the punch.
+
 ---
 
 ## Installation

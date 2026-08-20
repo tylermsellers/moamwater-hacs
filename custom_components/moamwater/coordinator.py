@@ -63,6 +63,7 @@ class MoAmWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # (instead of UpdateFailed) so HA actually starts the reauth
             # flow and surfaces a notification, rather than leaving the
             # entities silently unavailable indefinitely.
+            self._async_kick_off_automated_reauth()
             raise ConfigEntryAuthFailed("MyWater requires a new MFA challenge") from exc
         except MoAmWaterAuthError as exc:
             raise ConfigEntryAuthFailed(f"MyWater authentication error: {exc}") from exc
@@ -94,3 +95,18 @@ class MoAmWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if entry is None:
             return
         _async_persist_tokens_if_changed(self.hass, entry, self.client)
+
+    def _async_kick_off_automated_reauth(self) -> None:
+        """Fire-and-forget: immediately submit the stored credentials so
+        Okta sends its SMS challenge right away, instead of waiting for a
+        human (or an automation calling `moamwater.start_reauth` itself) to
+        notice this entry needs reauth first. See services.py's module
+        docstring for the full two-step (start_reauth/submit_mfa_code)
+        design this feeds into.
+        """
+        entry = self.hass.config_entries.async_get_entry(self.entry_id)
+        if entry is None:
+            return
+        from .services import async_start_reauth
+
+        self.hass.async_create_task(async_start_reauth(self.hass, entry))
